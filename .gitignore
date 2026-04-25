@@ -1,0 +1,15 @@
+.venv/
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+*.py[cod]
+
+# Local OAuth/token files — never commit credentials
+auth/
+.cache-spotify
+*.cache-spotify
+*.token
+
+# Runtime output
+sync-report.json
+*.log
