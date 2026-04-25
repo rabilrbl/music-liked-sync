@@ -9,6 +9,7 @@ import argparse
 import json
 import os
 import re
+import sqlite3
 import sys
 import time
 import unicodedata
@@ -28,6 +29,8 @@ SPOTIFY_SCOPES = "user-library-read user-library-modify"
 DEFAULT_MARKET = "IN"
 DEFAULT_BATCH_SIZE = 50
 DEFAULT_BATCH_DELAY = 1.0
+DEFAULT_CACHE_DB = "state/sync-cache.sqlite3"
+DEFAULT_LIBRARY_CACHE_TTL = 0.0
 YTM_RETRY_ATTEMPTS = 4
 YTM_RETRY_BASE_DELAY = 2.0
 
@@ -208,6 +211,166 @@ def retry_ytm_call(
             sleep_fn(delay)
     if last_exc:
         raise last_exc
+
+
+class SyncCache:
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        with self._connect() as conn:
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS matches (
+                    direction TEXT NOT NULL,
+                    source_key TEXT NOT NULL,
+                    source_track_json TEXT NOT NULL,
+                    target_track_json TEXT NOT NULL,
+                    updated_at REAL NOT NULL,
+                    PRIMARY KEY (direction, source_key)
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS liked_tracks (
+                    service TEXT NOT NULL,
+                    source_id TEXT NOT NULL,
+                    updated_at REAL NOT NULL,
+                    PRIMARY KEY (service, source_id)
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS library_cache (
+                    service TEXT NOT NULL PRIMARY KEY,
+                    tracks_json TEXT NOT NULL,
+                    fetched_at REAL NOT NULL
+                )
+                """
+            )
+            conn.commit()
+
+    def _connect(self) -> sqlite3.Connection:
+        return sqlite3.connect(self.path)
+
+    @staticmethod
+    def _serialize_track(track: Track) -> str:
+        return json.dumps(asdict(track), ensure_ascii=False)
+
+    @staticmethod
+    def _deserialize_track(payload: str) -> Track:
+        data = json.loads(payload)
+        return Track(
+            title=str(data.get("title") or ""),
+            artists=tuple(str(artist) for artist in (data.get("artists") or [])),
+            source_id=str(data.get("source_id") or ""),
+            duration_ms=data.get("duration_ms"),
+            album=data.get("album"),
+        )
+
+    def store_match(self, direction: str, source: Track, target: Track) -> None:
+        source_key = normalize_key(source.title, source.artists)
+        now = time.time()
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO matches(direction, source_key, source_track_json, target_track_json, updated_at)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(direction, source_key) DO UPDATE SET
+                    source_track_json=excluded.source_track_json,
+                    target_track_json=excluded.target_track_json,
+                    updated_at=excluded.updated_at
+                """,
+                (
+                    direction,
+                    source_key,
+                    self._serialize_track(source),
+                    self._serialize_track(target),
+                    now,
+                ),
+            )
+            conn.commit()
+
+    def get_match(self, direction: str, source: Track) -> Track | None:
+        source_key = normalize_key(source.title, source.artists)
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT target_track_json FROM matches WHERE direction = ? AND source_key = ?",
+                (direction, source_key),
+            ).fetchone()
+        if not row:
+            return None
+        try:
+            return self._deserialize_track(row[0])
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return None
+
+    def mark_liked(self, service: str, source_id: str) -> None:
+        self.mark_liked_many(service, [source_id])
+
+    def mark_liked_many(self, service: str, source_ids: Sequence[str]) -> None:
+        now = time.time()
+        rows = [(service, source_id, now) for source_id in sorted(set(source_ids)) if source_id]
+        if not rows:
+            return
+        with self._connect() as conn:
+            conn.executemany(
+                """
+                INSERT INTO liked_tracks(service, source_id, updated_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(service, source_id) DO UPDATE SET
+                    updated_at=excluded.updated_at
+                """,
+                rows,
+            )
+            conn.commit()
+
+    def is_liked(self, service: str, source_id: str) -> bool:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM liked_tracks WHERE service = ? AND source_id = ? LIMIT 1",
+                (service, source_id),
+            ).fetchone()
+        return row is not None
+
+    def store_library(self, service: str, tracks: Sequence[Track]) -> None:
+        payload = json.dumps([asdict(track) for track in tracks], ensure_ascii=False)
+        now = time.time()
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO library_cache(service, tracks_json, fetched_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(service) DO UPDATE SET
+                    tracks_json=excluded.tracks_json,
+                    fetched_at=excluded.fetched_at
+                """,
+                (service, payload, now),
+            )
+            conn.commit()
+
+    def get_library(self, service: str, max_age_seconds: float) -> list[Track] | None:
+        if max_age_seconds <= 0:
+            return None
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT tracks_json, fetched_at FROM library_cache WHERE service = ?",
+                (service,),
+            ).fetchone()
+        if not row:
+            return None
+        tracks_json, fetched_at = row
+        if (time.time() - float(fetched_at)) > max_age_seconds:
+            return None
+        try:
+            raw_tracks = json.loads(tracks_json)
+            if not isinstance(raw_tracks, list):
+                return None
+            return [self._deserialize_track(json.dumps(item, ensure_ascii=False)) for item in raw_tracks]
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return None
 
 
 class SpotifyBackend:
@@ -414,6 +577,10 @@ def resolve_matches(
     batch_size: int = DEFAULT_BATCH_SIZE,
     batch_delay: float = DEFAULT_BATCH_DELAY,
     sleep_fn: Callable[[float], None] = time.sleep,
+    cache: SyncCache | None = None,
+    cache_direction: str | None = None,
+    cache_read: bool = True,
+    cache_write: bool = True,
 ) -> tuple[list[tuple[Track, Track]], list[Track]]:
     matched: list[tuple[Track, Track]] = []
     unmatched: list[Track] = []
@@ -421,10 +588,19 @@ def resolve_matches(
     chunks = batched(candidates_to_process, batch_size)
     for batch_index, chunk in enumerate(chunks):
         for wanted in chunk:
+            cached_match = None
+            if cache and cache_direction and cache_read:
+                cached_match = cache.get_match(cache_direction, wanted)
+            if cached_match:
+                matched.append((wanted, cached_match))
+                print(f"{label}: {len(matched)} matched, {len(unmatched)} unmatched", end="\r", flush=True)
+                continue
             candidates = search_fn(wanted)
             match = best_match(wanted, candidates)
             if match:
                 matched.append((wanted, match))
+                if cache and cache_direction and cache_write:
+                    cache.store_match(cache_direction, wanted, match)
             else:
                 unmatched.append(wanted)
             print(f"{label}: {len(matched)} matched, {len(unmatched)} unmatched", end="\r", flush=True)
@@ -449,6 +625,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-add", type=positive_int, default=None, help="optional cap on tracks to add per direction; default processes all missing tracks")
     parser.add_argument("--batch-size", type=positive_int, default=int(os.environ.get("MUSIC_SYNC_BATCH_SIZE", DEFAULT_BATCH_SIZE)), help="tracks to search/save before pausing; Spotify writes are capped to 50 by API")
     parser.add_argument("--batch-delay", type=non_negative_float, default=float(os.environ.get("MUSIC_SYNC_BATCH_DELAY", DEFAULT_BATCH_DELAY)), help="seconds to sleep between batches")
+    parser.add_argument("--cache-db", default=os.environ.get("MUSIC_SYNC_CACHE_DB", DEFAULT_CACHE_DB), help="sqlite path for persistent sync cache")
+    parser.add_argument("--cache-library-ttl", type=non_negative_float, default=float(os.environ.get("MUSIC_SYNC_LIBRARY_CACHE_TTL", DEFAULT_LIBRARY_CACHE_TTL)), help="seconds to reuse cached liked libraries; 0 disables library reuse")
+    parser.add_argument("--no-cache-read", dest="cache_read", action="store_false", help="disable reading cached matches/library")
+    parser.add_argument("--no-cache-write", dest="cache_write", action="store_false", help="disable writing cache")
     parser.add_argument("--spotify-to-ytm", action="store_true", help="only sync Spotify liked songs into YouTube Music")
     parser.add_argument("--ytm-to-spotify", action="store_true", help="only sync YouTube Music liked songs into Spotify")
     parser.add_argument("--report", default="sync-report.json", help="write JSON report here")
@@ -469,6 +649,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         cache_path=args.spotify_cache,
         market=args.market,
     )
+    cache_path = Path(args.cache_db).expanduser()
+    if not cache_path.is_absolute():
+        cache_path = Path.cwd() / cache_path
+    cache = SyncCache(cache_path)
     try:
         ytm = YTMusicBackend(auth_path, args.yt_client_id, args.yt_client_secret, auth_mode=args.yt_auth)
     except FileNotFoundError as exc:
@@ -481,8 +665,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         return 2
 
-    spotify_liked = spotify.liked_tracks()
-    ytm_liked = ytm.liked_tracks()
+    spotify_liked = cache.get_library("spotify", args.cache_library_ttl) if args.cache_read else None
+    if spotify_liked is None:
+        spotify_liked = spotify.liked_tracks()
+        if args.cache_write:
+            cache.store_library("spotify", spotify_liked)
+
+    ytm_liked = cache.get_library("ytm", args.cache_library_ttl) if args.cache_read else None
+    if ytm_liked is None:
+        ytm_liked = ytm.liked_tracks()
+        if args.cache_write:
+            cache.store_library("ytm", ytm_liked)
     do_spotify_to_ytm = args.spotify_to_ytm or not args.ytm_to_spotify
     do_ytm_to_spotify = args.ytm_to_spotify or not args.spotify_to_ytm
 
@@ -496,6 +689,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         "batch_delay": args.batch_delay,
         "max_add": args.max_add,
         "yt_auth": ytm.mode,
+        "cache_db": str(cache_path),
+        "cache_read": bool(args.cache_read),
+        "cache_write": bool(args.cache_write),
+        "cache_library_ttl": args.cache_library_ttl,
     }
 
     if do_spotify_to_ytm:
@@ -507,13 +704,22 @@ def main(argv: Sequence[str] | None = None) -> int:
             "Spotify → YTM",
             batch_size=args.batch_size,
             batch_delay=args.batch_delay,
+            cache=cache,
+            cache_direction="spotify_to_ytm",
+            cache_read=args.cache_read,
+            cache_write=args.cache_write,
         )
         if args.apply:
+            to_like = [match for _, match in matched]
+            if args.cache_read:
+                to_like = [track for track in to_like if not cache.is_liked("ytm", track.source_id)]
             ytm.like_tracks(
-                [match for _, match in matched],
+                to_like,
                 batch_size=args.batch_size,
                 batch_delay=args.batch_delay,
             )
+            if args.cache_write:
+                cache.mark_liked_many("ytm", [track.source_id for track in to_like])
         report["spotify_to_ytm"] = {
             "missing_count": len(missing),
             "matched_count": len(matched),
@@ -531,13 +737,22 @@ def main(argv: Sequence[str] | None = None) -> int:
             "YTM → Spotify",
             batch_size=args.batch_size,
             batch_delay=args.batch_delay,
+            cache=cache,
+            cache_direction="ytm_to_spotify",
+            cache_read=args.cache_read,
+            cache_write=args.cache_write,
         )
         if args.apply:
+            to_save = [match for _, match in matched]
+            if args.cache_read:
+                to_save = [track for track in to_save if not cache.is_liked("spotify", track.source_id)]
             spotify.save_tracks(
-                [match for _, match in matched],
+                to_save,
                 batch_size=args.batch_size,
                 batch_delay=args.batch_delay,
             )
+            if args.cache_write:
+                cache.mark_liked_many("spotify", [track.source_id for track in to_save])
         report["ytm_to_spotify"] = {
             "missing_count": len(missing),
             "matched_count": len(matched),
@@ -560,6 +775,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         "batch_delay": args.batch_delay,
         "max_add": args.max_add,
         "yt_auth": ytm.mode,
+        "cache_db": str(cache_path),
+        "cache_read": bool(args.cache_read),
+        "cache_write": bool(args.cache_write),
+        "cache_library_ttl": args.cache_library_ttl,
         "spotify_to_ytm": report["spotify_to_ytm"],
         "ytm_to_spotify": report["ytm_to_spotify"],
     }, ensure_ascii=False, indent=2))

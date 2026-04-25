@@ -8,6 +8,7 @@ The tool is conservative by design:
 - Matches by normalized title + artist, then fuzzy title/artist/duration.
 - Unmatched tracks are reported and skipped.
 - Writes a JSON report, default `sync-report.json`.
+- Stores persistent sync state in sqlite (`state/sync-cache.sqlite3`) to avoid re-searching matches and re-liking already-applied tracks.
 - Processes all missing tracks by default, using configurable batches and pauses to reduce rate-limit risk.
 
 ## Requirements
@@ -122,6 +123,28 @@ Use `--max-add` only when you want to cap a run manually:
 uv run python src/music_liked_sync.py --max-add 100
 ```
 
+## Persistent sqlite cache
+
+By default, sync state is stored at `state/sync-cache.sqlite3`.
+
+This cache stores:
+- previously resolved cross-service matches (so next runs skip repeat search calls)
+- IDs already liked/saved by this tool (so apply runs skip duplicate write calls)
+- optional cached full liked libraries (disabled by default)
+
+Useful flags:
+
+```bash
+# custom sqlite path
+uv run python src/music_liked_sync.py --cache-db state/my-sync.sqlite3
+
+# reuse cached liked libraries for 30 minutes
+uv run python src/music_liked_sync.py --cache-library-ttl 1800
+
+# disable cache reads/writes for a clean run
+uv run python src/music_liked_sync.py --no-cache-read --no-cache-write
+```
+
 ## Apply bidirectional sync
 
 ```bash
@@ -154,6 +177,10 @@ uv run python src/music_liked_sync.py --ytm-to-spotify --apply
 --market IN
 --batch-size 50                # tracks to process before pausing
 --batch-delay 1.0              # seconds to sleep between batches
+--cache-db state/sync-cache.sqlite3
+--cache-library-ttl 0.0        # seconds to reuse cached liked libraries; 0 disables
+--no-cache-read
+--no-cache-write
 --max-add VALUE                # optional cap per direction; omitted means all missing tracks
 --report sync-report.json
 --apply
