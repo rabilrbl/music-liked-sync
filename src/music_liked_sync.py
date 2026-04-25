@@ -282,16 +282,47 @@ class SpotifyBackend:
 
 
 class YTMusicBackend:
-    def __init__(self, oauth_path: Path, client_id: str | None, client_secret: str | None) -> None:
+    def __init__(
+        self,
+        auth_path: Path,
+        client_id: str | None,
+        client_secret: str | None,
+        auth_mode: str = "auto",
+    ) -> None:
         from ytmusicapi import YTMusic
         from ytmusicapi.auth.oauth import OAuthCredentials
 
-        if not oauth_path.exists():
-            raise FileNotFoundError(f"YouTube Music OAuth file missing: {oauth_path}")
+        if not auth_path.exists():
+            raise FileNotFoundError(f"YouTube Music auth file missing: {auth_path}")
+
+        self.mode = self.resolve_auth_mode(auth_mode, auth_path, client_id, client_secret)
         creds = None
-        if client_id and client_secret:
+        if self.mode == "oauth" and client_id and client_secret:
             creds = OAuthCredentials(client_id=client_id, client_secret=client_secret)
-        self.client = YTMusic(str(oauth_path), oauth_credentials=creds)
+        self.client = YTMusic(str(auth_path), oauth_credentials=creds)
+
+    @staticmethod
+    def resolve_auth_mode(
+        auth_mode: str,
+        auth_path: Path,
+        client_id: str | None,
+        client_secret: str | None,
+    ) -> str:
+        if auth_mode != "auto":
+            return auth_mode
+        try:
+            data = json.loads(auth_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            data = {}
+        if isinstance(data, dict):
+            keys = {str(key).lower() for key in data}
+            if {"cookie", "authorization"} <= keys:
+                return "browser"
+            if "refresh_token" in keys or "access_token" in keys:
+                return "oauth"
+        if client_id and client_secret:
+            return "oauth"
+        return "browser"
 
     def liked_tracks(self, limit: int | None = None) -> list[Track]:
         result = self.client.get_liked_songs(limit=limit or 10000)
@@ -353,7 +384,8 @@ def resolve_matches(
 
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Sync Spotify and YouTube Music liked songs")
-    parser.add_argument("--oauth", default=os.environ.get("YTMUSIC_OAUTH", "auth/oauth.json"), help="ytmusicapi oauth.json path")
+    parser.add_argument("--yt-auth", choices=("auto", "oauth", "browser"), default=os.environ.get("YTMUSIC_AUTH", "auto"), help="YouTube Music auth type; auto detects oauth.json vs browser headers JSON")
+    parser.add_argument("--yt-auth-file", "--oauth", dest="yt_auth_file", default=os.environ.get("YTMUSIC_AUTH_FILE") or os.environ.get("YTMUSIC_OAUTH", "auth/oauth.json"), help="YouTube Music auth JSON path; --oauth is kept as a backwards-compatible alias")
     parser.add_argument("--yt-client-id", default=os.environ.get("YTMUSIC_CLIENT_ID"))
     parser.add_argument("--yt-client-secret", default=os.environ.get("YTMUSIC_CLIENT_SECRET"))
     parser.add_argument("--spotify-auth", choices=("auto", "oauth", "hermes"), default=os.environ.get("SPOTIFY_AUTH", "auto"), help="Spotify auth backend: oauth uses Spotipy; hermes reuses local Hermes auth if available")
@@ -374,9 +406,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_arg_parser().parse_args(argv)
-    oauth_path = Path(args.oauth).expanduser()
-    if not oauth_path.is_absolute():
-        oauth_path = Path.cwd() / oauth_path
+    auth_path = Path(args.yt_auth_file).expanduser()
+    if not auth_path.is_absolute():
+        auth_path = Path.cwd() / auth_path
 
     spotify = SpotifyBackend(
         auth_mode=args.spotify_auth,
@@ -387,12 +419,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         market=args.market,
     )
     try:
-        ytm = YTMusicBackend(oauth_path, args.yt_client_id, args.yt_client_secret)
+        ytm = YTMusicBackend(auth_path, args.yt_client_id, args.yt_client_secret, auth_mode=args.yt_auth)
     except FileNotFoundError as exc:
         print(str(exc), file=sys.stderr)
         print(
-            "Run: mkdir -p auth && uv run ytmusicapi oauth --file auth/oauth.json "
-            "--client-id '<CLIENT_ID>' --client-secret '<CLIENT_SECRET>'",
+            "Run one of: uv run ytmusicapi oauth --file auth/oauth.json "
+            "--client-id '<CLIENT_ID>' --client-secret '<CLIENT_SECRET>'; "
+            "or uv run ytmusicapi browser --file auth/browser.json",
             file=sys.stderr,
         )
         return 2
@@ -411,6 +444,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "batch_size": args.batch_size,
         "batch_delay": args.batch_delay,
         "max_add": args.max_add,
+        "yt_auth": ytm.mode,
     }
 
     if do_spotify_to_ytm:
@@ -474,6 +508,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "batch_size": args.batch_size,
         "batch_delay": args.batch_delay,
         "max_add": args.max_add,
+        "yt_auth": ytm.mode,
         "spotify_to_ytm": report["spotify_to_ytm"],
         "ytm_to_spotify": report["ytm_to_spotify"],
     }, ensure_ascii=False, indent=2))

@@ -1,4 +1,12 @@
-from music_liked_sync import Track, SpotifyBackend, YTMusicBackend, best_match, build_arg_parser, normalize_key, parse_ytm_track
+from music_liked_sync import (
+    Track,
+    SpotifyBackend,
+    YTMusicBackend,
+    best_match,
+    build_arg_parser,
+    normalize_key,
+    parse_ytm_track,
+)
 
 
 def test_normalize_key_ignores_case_punctuation_and_common_suffixes():
@@ -54,6 +62,28 @@ def test_parser_defaults_to_all_missing_with_configurable_batches():
     assert args.max_add is None
     assert args.batch_size == 50
     assert args.batch_delay == 1.0
+    assert args.yt_auth == "auto"
+    assert args.yt_auth_file == "auth/oauth.json"
+
+
+def test_parser_accepts_browser_youtube_music_auth_file():
+    args = build_arg_parser().parse_args(["--yt-auth", "browser", "--yt-auth-file", "auth/browser.json"])
+    assert args.yt_auth == "browser"
+    assert args.yt_auth_file == "auth/browser.json"
+
+
+def test_ytmusic_backend_detects_browser_auth_file_even_when_oauth_env_exists(tmp_path):
+    auth_file = tmp_path / "browser.json"
+    auth_file.write_text('{"cookie":"SID=x", "authorization":"SAPISIDHASH y", "x-goog-authuser":"0"}')
+
+    assert YTMusicBackend.resolve_auth_mode("auto", auth_file, "client-id", "client-secret") == "browser"
+
+
+def test_ytmusic_backend_detects_oauth_auth_file(tmp_path):
+    auth_file = tmp_path / "oauth.json"
+    auth_file.write_text('{"refresh_token":"refresh", "access_token":"access"}')
+
+    assert YTMusicBackend.resolve_auth_mode("auto", auth_file, "client-id", "client-secret") == "oauth"
 
 
 def test_spotify_save_tracks_uses_configurable_batches():

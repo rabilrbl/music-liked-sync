@@ -15,7 +15,7 @@ The tool is conservative by design:
 - Python 3.11+
 - [`uv`](https://docs.astral.sh/uv/)
 - Spotify Developer app credentials
-- Google Cloud OAuth client for YouTube Data API, type **TVs and Limited Input devices**
+- Google Cloud OAuth client for YouTube Data API, type **TVs and Limited Input devices**, or browser-header auth from `music.youtube.com`
 
 ## Install
 
@@ -58,6 +58,8 @@ uv run python src/music_liked_sync.py \
 
 ## YouTube Music auth setup
 
+### Option A: OAuth
+
 Create a Google Cloud OAuth client for YouTube Data API, application type **TVs and Limited Input devices**, then run:
 
 ```bash
@@ -68,14 +70,36 @@ uv run ytmusicapi oauth \
   --client-secret '<youtube-client-secret>'
 ```
 
-Keep these exports for future runs:
+Keep these exports for future OAuth runs:
 
 ```bash
+export YTMUSIC_AUTH=oauth
+export YTMUSIC_AUTH_FILE='auth/oauth.json'
 export YTMUSIC_CLIENT_ID='<youtube-client-id>'
 export YTMUSIC_CLIENT_SECRET='<youtube-client-secret>'
 ```
 
-`auth/` is gitignored because it contains tokens.
+If OAuth returns `HTTP 400: Bad Request. Request contains an invalid argument`, use browser auth instead.
+
+### Option B: Browser headers
+
+This is the more reliable fallback when YouTube Music rejects OAuth requests.
+
+```bash
+mkdir -p auth
+uv run ytmusicapi browser --file auth/browser.json
+```
+
+Paste raw request headers copied from a logged-in `music.youtube.com/youtubei/v1/browse` request.
+The headers must include `cookie`, `authorization`, and `x-goog-authuser`.
+
+Then run with:
+
+```bash
+uv run python src/music_liked_sync.py --yt-auth browser --yt-auth-file auth/browser.json
+```
+
+`auth/` is gitignored because it contains tokens/cookies.
 
 ## Dry-run
 
@@ -122,9 +146,11 @@ uv run python src/music_liked_sync.py --ytm-to-spotify --apply
 --spotify-client-secret VALUE
 --spotify-redirect-uri VALUE
 --spotify-cache PATH
---oauth PATH                    # YouTube Music ytmusicapi oauth.json
---yt-client-id VALUE
---yt-client-secret VALUE
+--yt-auth {auto,oauth,browser}
+--yt-auth-file PATH              # YouTube Music oauth.json or browser headers JSON
+--oauth PATH                    # backwards-compatible alias for --yt-auth-file
+--yt-client-id VALUE            # OAuth mode only
+--yt-client-secret VALUE        # OAuth mode only
 --market IN
 --batch-size 50                # tracks to process before pausing
 --batch-delay 1.0              # seconds to sleep between batches
