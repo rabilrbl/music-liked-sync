@@ -57,6 +57,30 @@ def test_parser_accepts_spotify_oauth_settings():
     assert args.spotify_cache == ".cache-spotify"
 
 
+def test_parser_accepts_spotify_pkce_without_client_secret():
+    args = build_arg_parser().parse_args(
+        [
+            "--spotify-auth",
+            "pkce",
+            "--spotify-client-id",
+            "cid",
+            "--spotify-redirect-uri",
+            "http://127.0.0.1:43827/spotify/callback",
+            "--spotify-cache",
+            ".cache-spotify-pkce",
+        ]
+    )
+    assert args.spotify_auth == "pkce"
+    assert args.spotify_client_id == "cid"
+    assert args.spotify_client_secret is None
+    assert args.spotify_redirect_uri == "http://127.0.0.1:43827/spotify/callback"
+    assert args.spotify_cache == ".cache-spotify-pkce"
+
+
+def test_spotify_auto_auth_prefers_pkce_when_client_id_has_no_secret():
+    assert SpotifyBackend._resolve_auth_mode("auto", "cid", None) == "pkce"
+
+
 def test_parser_defaults_to_all_missing_with_configurable_batches():
     args = build_arg_parser().parse_args([])
     assert args.max_add is None

@@ -141,7 +141,7 @@ uv run python src/music_liked_sync.py --ytm-to-spotify --apply
 ## Options
 
 ```text
---spotify-auth {auto,oauth,hermes}
+--spotify-auth {auto,oauth,pkce,hermes}
 --spotify-client-id VALUE
 --spotify-client-secret VALUE
 --spotify-redirect-uri VALUE
@@ -160,7 +160,15 @@ uv run python src/music_liked_sync.py --ytm-to-spotify --apply
 ```
 
 `--spotify-auth hermes` is only for local Hermes Agent users who already have Hermes Spotify auth configured.
-Most users should use `--spotify-auth oauth` or default `auto`.
+Most users should use `--spotify-auth oauth`, `--spotify-auth pkce`, or default `auto`.
+Use `pkce` when you only have a Spotify Client ID and no client secret:
+
+```bash
+uv run python src/music_liked_sync.py \
+  --spotify-auth pkce \
+  --spotify-client-id '<spotify-client-id>' \
+  --spotify-redirect-uri 'http://127.0.0.1:43827/spotify/callback'
+```
 
 ## Development
 

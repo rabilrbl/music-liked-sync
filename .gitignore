@@ -7,6 +7,7 @@ __pycache__/
 # Local OAuth/token files — never commit credentials
 auth/
 .cache-spotify
+.cache-spotify-pkce
 *.cache-spotify
 *.token
 

@@ -203,10 +203,21 @@ class SpotifyBackend:
             return
 
         from spotipy import Spotify
-        from spotipy.oauth2 import SpotifyOAuth
+        from spotipy.oauth2 import SpotifyOAuth, SpotifyPKCE
 
-        self.client = Spotify(
-            auth_manager=SpotifyOAuth(
+        auth_manager = (
+            SpotifyPKCE(
+                client_id=client_id or os.environ.get("SPOTIPY_CLIENT_ID") or os.environ.get("SPOTIFY_CLIENT_ID"),
+                redirect_uri=redirect_uri
+                or os.environ.get("SPOTIPY_REDIRECT_URI")
+                or os.environ.get("SPOTIFY_REDIRECT_URI")
+                or "http://127.0.0.1:8888/callback",
+                scope=SPOTIFY_SCOPES,
+                cache_path=cache_path or os.environ.get("SPOTIFY_TOKEN_CACHE") or ".cache-spotify",
+                open_browser=True,
+            )
+            if self.mode == "pkce"
+            else SpotifyOAuth(
                 client_id=client_id or os.environ.get("SPOTIPY_CLIENT_ID") or os.environ.get("SPOTIFY_CLIENT_ID"),
                 client_secret=client_secret
                 or os.environ.get("SPOTIPY_CLIENT_SECRET")
@@ -220,17 +231,20 @@ class SpotifyBackend:
                 open_browser=True,
             )
         )
+        self.client = Spotify(auth_manager=auth_manager)
 
     @staticmethod
     def _resolve_auth_mode(auth_mode: str, client_id: str | None, client_secret: str | None) -> str:
         if auth_mode != "auto":
             return auth_mode
-        has_spotify_oauth = bool(
-            (client_id or os.environ.get("SPOTIPY_CLIENT_ID") or os.environ.get("SPOTIFY_CLIENT_ID"))
-            and (client_secret or os.environ.get("SPOTIPY_CLIENT_SECRET") or os.environ.get("SPOTIFY_CLIENT_SECRET"))
+        has_spotify_client_id = bool(client_id or os.environ.get("SPOTIPY_CLIENT_ID") or os.environ.get("SPOTIFY_CLIENT_ID"))
+        has_spotify_client_secret = bool(
+            client_secret or os.environ.get("SPOTIPY_CLIENT_SECRET") or os.environ.get("SPOTIFY_CLIENT_SECRET")
         )
-        if has_spotify_oauth:
+        if has_spotify_client_id and has_spotify_client_secret:
             return "oauth"
+        if has_spotify_client_id:
+            return "pkce"
         if Path("/var/home/rabil/.hermes/hermes-agent/plugins/spotify/client.py").exists():
             return "hermes"
         return "oauth"
@@ -388,7 +402,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--yt-auth-file", "--oauth", dest="yt_auth_file", default=os.environ.get("YTMUSIC_AUTH_FILE") or os.environ.get("YTMUSIC_OAUTH", "auth/oauth.json"), help="YouTube Music auth JSON path; --oauth is kept as a backwards-compatible alias")
     parser.add_argument("--yt-client-id", default=os.environ.get("YTMUSIC_CLIENT_ID"))
     parser.add_argument("--yt-client-secret", default=os.environ.get("YTMUSIC_CLIENT_SECRET"))
-    parser.add_argument("--spotify-auth", choices=("auto", "oauth", "hermes"), default=os.environ.get("SPOTIFY_AUTH", "auto"), help="Spotify auth backend: oauth uses Spotipy; hermes reuses local Hermes auth if available")
+    parser.add_argument("--spotify-auth", choices=("auto", "oauth", "pkce", "hermes"), default=os.environ.get("SPOTIFY_AUTH", "auto"), help="Spotify auth backend: oauth uses client secret, pkce uses client ID only, hermes reuses local Hermes auth if available")
     parser.add_argument("--spotify-client-id", default=os.environ.get("SPOTIFY_CLIENT_ID") or os.environ.get("SPOTIPY_CLIENT_ID"))
     parser.add_argument("--spotify-client-secret", default=os.environ.get("SPOTIFY_CLIENT_SECRET") or os.environ.get("SPOTIPY_CLIENT_SECRET"))
     parser.add_argument("--spotify-redirect-uri", default=os.environ.get("SPOTIFY_REDIRECT_URI") or os.environ.get("SPOTIPY_REDIRECT_URI") or "http://127.0.0.1:8888/callback")
