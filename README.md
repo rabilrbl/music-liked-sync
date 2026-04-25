@@ -8,6 +8,7 @@ The tool is conservative by design:
 - Matches by normalized title + artist, then fuzzy title/artist/duration.
 - Unmatched tracks are reported and skipped.
 - Writes a JSON report, default `sync-report.json`.
+- Processes all missing tracks by default, using configurable batches and pauses to reduce rate-limit risk.
 
 ## Requirements
 
@@ -78,24 +79,39 @@ export YTMUSIC_CLIENT_SECRET='<youtube-client-secret>'
 
 ## Dry-run
 
+By default, the tool scans and attempts to match **all** missing tracks in both directions.
+It works in batches of 50 and sleeps 1 second between batches.
+
 ```bash
-uv run python src/music_liked_sync.py --max-add 25
+uv run python src/music_liked_sync.py
+```
+
+Tune batching:
+
+```bash
+uv run python src/music_liked_sync.py --batch-size 25 --batch-delay 2
+```
+
+Use `--max-add` only when you want to cap a run manually:
+
+```bash
+uv run python src/music_liked_sync.py --max-add 100
 ```
 
 ## Apply bidirectional sync
 
 ```bash
-uv run python src/music_liked_sync.py --max-add 25 --apply
+uv run python src/music_liked_sync.py --apply
 ```
 
 ## Direction-specific sync
 
 ```bash
 # Spotify liked -> YouTube Music liked only
-uv run python src/music_liked_sync.py --spotify-to-ytm --max-add 25 --apply
+uv run python src/music_liked_sync.py --spotify-to-ytm --apply
 
 # YouTube Music liked -> Spotify liked only
-uv run python src/music_liked_sync.py --ytm-to-spotify --max-add 25 --apply
+uv run python src/music_liked_sync.py --ytm-to-spotify --apply
 ```
 
 ## Options
@@ -110,7 +126,9 @@ uv run python src/music_liked_sync.py --ytm-to-spotify --max-add 25 --apply
 --yt-client-id VALUE
 --yt-client-secret VALUE
 --market IN
---max-add 25
+--batch-size 50                # tracks to process before pausing
+--batch-delay 1.0              # seconds to sleep between batches
+--max-add VALUE                # optional cap per direction; omitted means all missing tracks
 --report sync-report.json
 --apply
 ```

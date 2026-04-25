@@ -15,6 +15,7 @@ import unicodedata
 from dataclasses import asdict, dataclass
 from difflib import SequenceMatcher
 from pathlib import Path
+from collections.abc import Callable
 from typing import Iterable, Sequence
 
 COMMON_TITLE_SUFFIX_RE = re.compile(
@@ -25,6 +26,8 @@ COMMON_TITLE_SUFFIX_RE = re.compile(
 )
 SPOTIFY_SCOPES = "user-library-read user-library-modify"
 DEFAULT_MARKET = "IN"
+DEFAULT_BATCH_SIZE = 50
+DEFAULT_BATCH_DELAY = 1.0
 
 
 @dataclass(frozen=True)
@@ -149,6 +152,36 @@ def unique_by_key(tracks: Iterable[Track]) -> dict[str, Track]:
     return out
 
 
+def positive_int(value: str) -> int:
+    parsed = int(value)
+    if parsed < 1:
+        raise argparse.ArgumentTypeError("must be >= 1")
+    return parsed
+
+
+def non_negative_float(value: str) -> float:
+    parsed = float(value)
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("must be >= 0")
+    return parsed
+
+
+def batched(items: Sequence, batch_size: int) -> list[Sequence]:
+    if batch_size < 1:
+        raise ValueError("batch_size must be >= 1")
+    return [items[start : start + batch_size] for start in range(0, len(items), batch_size)]
+
+
+def sleep_between_batches(
+    batch_index: int,
+    total_batches: int,
+    batch_delay: float,
+    sleep_fn: Callable[[float], None],
+) -> None:
+    if batch_delay > 0 and batch_index < total_batches - 1:
+        sleep_fn(batch_delay)
+
+
 class SpotifyBackend:
     def __init__(
         self,
@@ -229,14 +262,23 @@ class SpotifyBackend:
         items = ((page.get("tracks") or {}).get("items") or [])
         return [t for t in (parse_spotify_track(item) for item in items) if t]
 
-    def save_tracks(self, tracks: Sequence[Track]) -> None:
+    def save_tracks(
+        self,
+        tracks: Sequence[Track],
+        *,
+        batch_size: int = DEFAULT_BATCH_SIZE,
+        batch_delay: float = DEFAULT_BATCH_DELAY,
+        sleep_fn: Callable[[float], None] = time.sleep,
+    ) -> None:
         ids = [track.source_id.split(":")[-1] for track in tracks]
-        for chunk_start in range(0, len(ids), 50):
-            chunk = ids[chunk_start : chunk_start + 50]
+        effective_batch_size = min(batch_size, 50)  # Spotify save-tracks endpoint accepts max 50 IDs.
+        chunks = batched(ids, effective_batch_size)
+        for index, chunk in enumerate(chunks):
             if self.mode == "hermes":
                 self.client.request("PUT", "/me/tracks", params={"ids": ",".join(chunk)})
             else:
                 self.client.current_user_saved_tracks_add(tracks=chunk)
+            sleep_between_batches(index, len(chunks), batch_delay, sleep_fn)
 
 
 class YTMusicBackend:
@@ -261,10 +303,19 @@ class YTMusicBackend:
         items = self.client.search(query, filter="songs", limit=limit) or []
         return [t for t in (parse_ytm_track(item) for item in items) if t]
 
-    def like_tracks(self, tracks: Sequence[Track]) -> None:
-        for track in tracks:
-            self.client.rate_song(track.source_id, "LIKE")
-            time.sleep(0.15)
+    def like_tracks(
+        self,
+        tracks: Sequence[Track],
+        *,
+        batch_size: int = DEFAULT_BATCH_SIZE,
+        batch_delay: float = DEFAULT_BATCH_DELAY,
+        sleep_fn: Callable[[float], None] = time.sleep,
+    ) -> None:
+        chunks = batched(tracks, batch_size)
+        for index, chunk in enumerate(chunks):
+            for track in chunk:
+                self.client.rate_song(track.source_id, "LIKE")
+            sleep_between_batches(index, len(chunks), batch_delay, sleep_fn)
 
 
 def compute_missing(left: Sequence[Track], right: Sequence[Track]) -> list[Track]:
@@ -272,17 +323,30 @@ def compute_missing(left: Sequence[Track], right: Sequence[Track]) -> list[Track
     return [track for track in left if normalize_key(track.title, track.artists) not in right_keys]
 
 
-def resolve_matches(missing: Sequence[Track], search_fn, max_add: int, label: str) -> tuple[list[tuple[Track, Track]], list[Track]]:
+def resolve_matches(
+    missing: Sequence[Track],
+    search_fn,
+    max_add: int | None,
+    label: str,
+    *,
+    batch_size: int = DEFAULT_BATCH_SIZE,
+    batch_delay: float = DEFAULT_BATCH_DELAY,
+    sleep_fn: Callable[[float], None] = time.sleep,
+) -> tuple[list[tuple[Track, Track]], list[Track]]:
     matched: list[tuple[Track, Track]] = []
     unmatched: list[Track] = []
-    for wanted in missing[:max_add]:
-        candidates = search_fn(wanted)
-        match = best_match(wanted, candidates)
-        if match:
-            matched.append((wanted, match))
-        else:
-            unmatched.append(wanted)
-        print(f"{label}: {len(matched)} matched, {len(unmatched)} unmatched", end="\r", flush=True)
+    candidates_to_process = list(missing if max_add is None else missing[:max_add])
+    chunks = batched(candidates_to_process, batch_size)
+    for batch_index, chunk in enumerate(chunks):
+        for wanted in chunk:
+            candidates = search_fn(wanted)
+            match = best_match(wanted, candidates)
+            if match:
+                matched.append((wanted, match))
+            else:
+                unmatched.append(wanted)
+            print(f"{label}: {len(matched)} matched, {len(unmatched)} unmatched", end="\r", flush=True)
+        sleep_between_batches(batch_index, len(chunks), batch_delay, sleep_fn)
     print("".ljust(90), end="\r")
     return matched, unmatched
 
@@ -299,7 +363,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--spotify-cache", default=os.environ.get("SPOTIFY_TOKEN_CACHE", ".cache-spotify"), help="Spotipy OAuth token cache path")
     parser.add_argument("--market", default=os.environ.get("MUSIC_SYNC_MARKET", DEFAULT_MARKET), help="Spotify market code used for search/library reads")
     parser.add_argument("--apply", action="store_true", help="actually save/like matched tracks; default is dry-run")
-    parser.add_argument("--max-add", type=int, default=25, help="max tracks to add per direction per run")
+    parser.add_argument("--max-add", type=positive_int, default=None, help="optional cap on tracks to add per direction; default processes all missing tracks")
+    parser.add_argument("--batch-size", type=positive_int, default=int(os.environ.get("MUSIC_SYNC_BATCH_SIZE", DEFAULT_BATCH_SIZE)), help="tracks to search/save before pausing; Spotify writes are capped to 50 by API")
+    parser.add_argument("--batch-delay", type=non_negative_float, default=float(os.environ.get("MUSIC_SYNC_BATCH_DELAY", DEFAULT_BATCH_DELAY)), help="seconds to sleep between batches")
     parser.add_argument("--spotify-to-ytm", action="store_true", help="only sync Spotify liked songs into YouTube Music")
     parser.add_argument("--ytm-to-spotify", action="store_true", help="only sync YouTube Music liked songs into Spotify")
     parser.add_argument("--report", default="sync-report.json", help="write JSON report here")
@@ -342,13 +408,27 @@ def main(argv: Sequence[str] | None = None) -> int:
         "ytm_liked_count": len(ytm_liked),
         "spotify_to_ytm": {},
         "ytm_to_spotify": {},
+        "batch_size": args.batch_size,
+        "batch_delay": args.batch_delay,
+        "max_add": args.max_add,
     }
 
     if do_spotify_to_ytm:
         missing = compute_missing(spotify_liked, ytm_liked)
-        matched, unmatched = resolve_matches(missing, ytm.search_track, args.max_add, "Spotify → YTM")
+        matched, unmatched = resolve_matches(
+            missing,
+            ytm.search_track,
+            args.max_add,
+            "Spotify → YTM",
+            batch_size=args.batch_size,
+            batch_delay=args.batch_delay,
+        )
         if args.apply:
-            ytm.like_tracks([match for _, match in matched])
+            ytm.like_tracks(
+                [match for _, match in matched],
+                batch_size=args.batch_size,
+                batch_delay=args.batch_delay,
+            )
         report["spotify_to_ytm"] = {
             "missing_count": len(missing),
             "matched_count": len(matched),
@@ -359,9 +439,20 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if do_ytm_to_spotify:
         missing = compute_missing(ytm_liked, spotify_liked)
-        matched, unmatched = resolve_matches(missing, spotify.search_track, args.max_add, "YTM → Spotify")
+        matched, unmatched = resolve_matches(
+            missing,
+            spotify.search_track,
+            args.max_add,
+            "YTM → Spotify",
+            batch_size=args.batch_size,
+            batch_delay=args.batch_delay,
+        )
         if args.apply:
-            spotify.save_tracks([match for _, match in matched])
+            spotify.save_tracks(
+                [match for _, match in matched],
+                batch_size=args.batch_size,
+                batch_delay=args.batch_delay,
+            )
         report["ytm_to_spotify"] = {
             "missing_count": len(missing),
             "matched_count": len(matched),
@@ -380,6 +471,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         "spotify_liked_count": len(spotify_liked),
         "ytm_liked_count": len(ytm_liked),
         "report": str(report_path),
+        "batch_size": args.batch_size,
+        "batch_delay": args.batch_delay,
+        "max_add": args.max_add,
         "spotify_to_ytm": report["spotify_to_ytm"],
         "ytm_to_spotify": report["ytm_to_spotify"],
     }, ensure_ascii=False, indent=2))
