@@ -386,12 +386,6 @@ class SpotifyBackend:
     ) -> None:
         self.market = market
         self.mode = self._resolve_auth_mode(auth_mode, client_id, client_secret)
-        if self.mode == "hermes":
-            sys.path.insert(0, "/var/home/rabil/.hermes/hermes-agent")
-            from plugins.spotify.client import SpotifyClient  # type: ignore
-
-            self.client = SpotifyClient()
-            return
 
         from spotipy import Spotify
         from spotipy.oauth2 import SpotifyOAuth, SpotifyPKCE
@@ -426,6 +420,8 @@ class SpotifyBackend:
 
     @staticmethod
     def _resolve_auth_mode(auth_mode: str, client_id: str | None, client_secret: str | None) -> str:
+        if auth_mode not in {"auto", "oauth", "pkce"}:
+            raise ValueError(f"unsupported Spotify auth backend: {auth_mode}")
         if auth_mode != "auto":
             return auth_mode
         has_spotify_client_id = bool(client_id or os.environ.get("SPOTIPY_CLIENT_ID") or os.environ.get("SPOTIFY_CLIENT_ID"))
@@ -436,18 +432,13 @@ class SpotifyBackend:
             return "oauth"
         if has_spotify_client_id:
             return "pkce"
-        if Path("/var/home/rabil/.hermes/hermes-agent/plugins/spotify/client.py").exists():
-            return "hermes"
         return "oauth"
 
     def liked_tracks(self) -> list[Track]:
         tracks: list[Track] = []
         offset = 0
         while True:
-            if self.mode == "hermes":
-                page = self.client.get_saved_tracks(limit=50, offset=offset, market=self.market)
-            else:
-                page = self.client.current_user_saved_tracks(limit=50, offset=offset, market=self.market)
+            page = self.client.current_user_saved_tracks(limit=50, offset=offset, market=self.market)
             items = page.get("items", []) or []
             for item in items:
                 parsed = parse_spotify_track(item)
@@ -460,10 +451,7 @@ class SpotifyBackend:
 
     def search_track(self, wanted: Track, limit: int = 5) -> list[Track]:
         query = f"track:{wanted.title} artist:{' '.join(wanted.artists[:1])}" if wanted.artists else wanted.title
-        if self.mode == "hermes":
-            page = self.client.search(query=query, search_types=["track"], limit=limit, market=self.market)
-        else:
-            page = self.client.search(q=query, type="track", limit=limit, market=self.market)
+        page = self.client.search(q=query, type="track", limit=limit, market=self.market)
         items = ((page.get("tracks") or {}).get("items") or [])
         return [t for t in (parse_spotify_track(item) for item in items) if t]
 
@@ -479,10 +467,7 @@ class SpotifyBackend:
         effective_batch_size = min(batch_size, 50)  # Spotify save-tracks endpoint accepts max 50 IDs.
         chunks = batched(ids, effective_batch_size)
         for index, chunk in enumerate(chunks):
-            if self.mode == "hermes":
-                self.client.request("PUT", "/me/tracks", params={"ids": ",".join(chunk)})
-            else:
-                self.client.current_user_saved_tracks_add(tracks=chunk)
+            self.client.current_user_saved_tracks_add(tracks=chunk)
             sleep_between_batches(index, len(chunks), batch_delay, sleep_fn)
 
 
@@ -615,7 +600,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--yt-auth-file", "--oauth", dest="yt_auth_file", default=os.environ.get("YTMUSIC_AUTH_FILE") or os.environ.get("YTMUSIC_OAUTH", "auth/oauth.json"), help="YouTube Music auth JSON path; --oauth is kept as a backwards-compatible alias")
     parser.add_argument("--yt-client-id", default=os.environ.get("YTMUSIC_CLIENT_ID"))
     parser.add_argument("--yt-client-secret", default=os.environ.get("YTMUSIC_CLIENT_SECRET"))
-    parser.add_argument("--spotify-auth", choices=("auto", "oauth", "pkce", "hermes"), default=os.environ.get("SPOTIFY_AUTH", "auto"), help="Spotify auth backend: oauth uses client secret, pkce uses client ID only, hermes reuses local Hermes auth if available")
+    parser.add_argument("--spotify-auth", choices=("auto", "oauth", "pkce"), default=os.environ.get("SPOTIFY_AUTH", "auto"), help="Spotify auth backend: oauth uses client secret, pkce uses client ID only")
     parser.add_argument("--spotify-client-id", default=os.environ.get("SPOTIFY_CLIENT_ID") or os.environ.get("SPOTIPY_CLIENT_ID"))
     parser.add_argument("--spotify-client-secret", default=os.environ.get("SPOTIFY_CLIENT_SECRET") or os.environ.get("SPOTIPY_CLIENT_SECRET"))
     parser.add_argument("--spotify-redirect-uri", default=os.environ.get("SPOTIFY_REDIRECT_URI") or os.environ.get("SPOTIPY_REDIRECT_URI") or "http://127.0.0.1:8888/callback")
