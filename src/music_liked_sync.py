@@ -28,6 +28,8 @@ SPOTIFY_SCOPES = "user-library-read user-library-modify"
 DEFAULT_MARKET = "IN"
 DEFAULT_BATCH_SIZE = 50
 DEFAULT_BATCH_DELAY = 1.0
+YTM_RETRY_ATTEMPTS = 4
+YTM_RETRY_BASE_DELAY = 2.0
 
 
 @dataclass(frozen=True)
@@ -180,6 +182,32 @@ def sleep_between_batches(
 ) -> None:
     if batch_delay > 0 and batch_index < total_batches - 1:
         sleep_fn(batch_delay)
+
+
+def retry_ytm_call(
+    fn,
+    *,
+    label: str,
+    attempts: int = YTM_RETRY_ATTEMPTS,
+    base_delay: float = YTM_RETRY_BASE_DELAY,
+    sleep_fn: Callable[[float], None] = time.sleep,
+):
+    last_exc: Exception | None = None
+    for attempt in range(1, attempts + 1):
+        try:
+            return fn()
+        except json.JSONDecodeError as exc:
+            last_exc = exc
+            if attempt >= attempts:
+                raise
+            delay = base_delay * attempt
+            print(
+                f"{label}: transient non-JSON response from YouTube Music; retry {attempt}/{attempts - 1} in {delay:.1f}s",
+                file=sys.stderr,
+            )
+            sleep_fn(delay)
+    if last_exc:
+        raise last_exc
 
 
 class SpotifyBackend:
@@ -339,13 +367,19 @@ class YTMusicBackend:
         return "browser"
 
     def liked_tracks(self, limit: int | None = None) -> list[Track]:
-        result = self.client.get_liked_songs(limit=limit or 10000)
+        result = retry_ytm_call(
+            lambda: self.client.get_liked_songs(limit=limit or 10000),
+            label="YTM get_liked_songs",
+        )
         items = result.get("tracks", []) if isinstance(result, dict) else result
         return [t for t in (parse_ytm_track(item) for item in (items or [])) if t]
 
     def search_track(self, wanted: Track, limit: int = 5) -> list[Track]:
         query = f"{wanted.title} {' '.join(wanted.artists)}".strip()
-        items = self.client.search(query, filter="songs", limit=limit) or []
+        items = retry_ytm_call(
+            lambda: self.client.search(query, filter="songs", limit=limit) or [],
+            label="YTM search",
+        )
         return [t for t in (parse_ytm_track(item) for item in items) if t]
 
     def like_tracks(
@@ -359,7 +393,10 @@ class YTMusicBackend:
         chunks = batched(tracks, batch_size)
         for index, chunk in enumerate(chunks):
             for track in chunk:
-                self.client.rate_song(track.source_id, "LIKE")
+                retry_ytm_call(
+                    lambda track_id=track.source_id: self.client.rate_song(track_id, "LIKE"),
+                    label=f"YTM rate_song {track.source_id}",
+                )
             sleep_between_batches(index, len(chunks), batch_delay, sleep_fn)
 
 
