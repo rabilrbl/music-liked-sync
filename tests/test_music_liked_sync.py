@@ -86,6 +86,65 @@ def test_parser_accepts_spotify_pkce_without_client_secret():
     assert args.spotify_cache == ".cache-spotify-pkce"
 
 
+def test_parser_accepts_spotify_web_session_settings():
+    args = build_arg_parser().parse_args(
+        [
+            "--spotify-auth",
+            "web-session",
+            "--spotify-web-session-dir",
+            "auth/spotify-web",
+            "--spotify-web-headless",
+            "--spotify-web-login-timeout",
+            "15",
+        ]
+    )
+    assert args.spotify_auth == "web-session"
+    assert args.spotify_web_session_dir == "auth/spotify-web"
+    assert args.spotify_web_headless is True
+    assert args.spotify_web_login_timeout == 15.0
+
+
+def test_spotify_web_client_retries_once_after_401(monkeypatch):
+    calls = []
+
+    def fake_request(payload, *, state):
+        calls.append((payload["operationName"], state.access_token, state.user_agent, payload["variables"]))
+        if state.access_token == "expired-token":
+            raise music_liked_sync.SpotifyAPIError("expired", http_status=401)
+        return {"data": {"me": {"library": {"tracks": {"items": [], "totalCount": 0}}}}}
+
+    tokens = iter([("expired-token", "ua1"), ("fresh-token", "ua2")])
+    monkeypatch.setattr(music_liked_sync, "spotify_pathfinder_request_json", fake_request)
+
+    client = music_liked_sync.SpotifyWebClient(lambda: next(tokens))
+
+    assert client.current_user_saved_tracks(limit=1, offset=0, market="IN") == {"items": [], "total": 0}
+    assert calls == [
+        ("fetchLibraryTracks", "expired-token", "ua1", {"offset": 0, "limit": 1}),
+        ("fetchLibraryTracks", "fresh-token", "ua2", {"offset": 0, "limit": 1}),
+    ]
+
+
+def test_safe_page_user_agent_falls_back_when_page_is_navigating():
+    class NavigatingPage:
+        def evaluate(self, expression):
+            raise RuntimeError("Execution context was destroyed, most likely because of a navigation")
+
+    assert music_liked_sync._safe_page_user_agent(NavigatingPage()) == music_liked_sync.DEFAULT_BROWSER_USER_AGENT
+
+
+def test_spotify_web_token_from_payload_rejects_anonymous_token():
+    try:
+        music_liked_sync.spotify_web_token_from_payload({"accessToken": "anon", "isAnonymous": True})
+    except RuntimeError as exc:
+        message = str(exc)
+    else:
+        raise AssertionError("expected anonymous token rejection")
+
+    assert "anonymous token" in message
+    assert music_liked_sync.spotify_web_token_from_payload({"accessToken": "user-token", "isAnonymous": False}) == "user-token"
+
+
 def test_spotify_auto_auth_prefers_pkce_when_client_id_has_no_secret():
     assert SpotifyBackend._resolve_auth_mode("auto", "cid", None) == "pkce"
 

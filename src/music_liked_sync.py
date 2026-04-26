@@ -14,6 +14,9 @@ import subprocess
 import sys
 import time
 import unicodedata
+import urllib.error
+import urllib.parse
+import urllib.request
 from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from difflib import SequenceMatcher
@@ -35,6 +38,15 @@ DEFAULT_BATCH_DELAY = 1.0
 DEFAULT_CACHE_DB = "state/sync-cache.sqlite3"
 DEFAULT_LIBRARY_CACHE_TTL = 0.0
 DEFAULT_SPOTIFY_CONFIG = "auth/spotify.json"
+DEFAULT_SPOTIFY_WEB_SESSION_DIR = "auth/spotify-web-session"
+DEFAULT_SPOTIFY_WEB_LOGIN_TIMEOUT = 300.0
+SPOTIFY_WEB_ORIGIN = "https://open.spotify.com"
+SPOTIFY_WEB_TOKEN_URL_PREFIX = f"{SPOTIFY_WEB_ORIGIN}/api/token"
+SPOTIFY_WEB_PATHFINDER_URL = "https://api-partner.spotify.com/pathfinder/v2/query"
+SPOTIFY_WEB_REQUIRED_COOKIE = "sp_dc"
+SPOTIFY_API_BASE = "https://api.spotify.com/v1"
+DEFAULT_BROWSER_USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36"
+
 DEFAULT_YT_BROWSER_AUTH_FILE = "auth/browser.json"
 DEFAULT_YT_BROWSER_SESSION_DIR = "auth/ytmusic-browser-session"
 YTMUSIC_ORIGIN = "https://music.youtube.com"
@@ -62,6 +74,14 @@ class Track:
     def display(self) -> str:
         artist = ", ".join(self.artists) if self.artists else "Unknown Artist"
         return f"{self.title} — {artist}"
+
+
+@dataclass(frozen=True)
+class SpotifyWebSessionState:
+    access_token: str
+    user_agent: str
+    client_token: str | None = None
+    app_version: str | None = None
 
 
 def _ascii_lower(value: str) -> str:
@@ -226,6 +246,10 @@ def non_negative_float(value: str) -> float:
     return parsed
 
 
+def config_bool(value: str | None) -> bool:
+    return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
 class CommandHeartbeat:
     def __init__(
         self,
@@ -310,7 +334,16 @@ def load_spotify_config(path: Path | str | None = None) -> dict[str, str]:
     if not config_path.is_absolute():
         config_path = Path.cwd() / config_path
     data = _read_json_object(config_path)
-    allowed = {"auth", "client_id", "client_secret", "redirect_uri", "cache"}
+    allowed = {
+        "auth",
+        "client_id",
+        "client_secret",
+        "redirect_uri",
+        "cache",
+        "web_session_dir",
+        "web_headless",
+        "web_login_timeout",
+    }
     return {key: str(value) for key, value in data.items() if key in allowed and value}
 
 
@@ -373,6 +406,68 @@ def _playwright_cookie_header(cookies: Sequence[dict]) -> str:
     return "; ".join(pairs)
 
 
+def _safe_page_user_agent(page, default: str = DEFAULT_BROWSER_USER_AGENT) -> str:
+    try:
+        value = page.evaluate("navigator.userAgent")
+    except Exception:
+        return default
+    return str(value or default)
+
+
+def spotify_web_token_from_payload(data: dict) -> str:
+    token = data.get("accessToken") or data.get("access_token")
+    if not token:
+        raise RuntimeError("Spotify Web Player token response did not include accessToken")
+    if data.get("isAnonymous") is True:
+        raise RuntimeError("Spotify Web Player returned an anonymous token; complete Spotify login, then rerun.")
+    return str(token)
+
+
+def wait_for_spotify_web_session_state(page, *, timeout_ms: int = 60_000) -> SpotifyWebSessionState:
+    captured_headers: dict[str, str] = {}
+
+    def is_token_response(response) -> bool:
+        return response.url.startswith(SPOTIFY_WEB_TOKEN_URL_PREFIX) and response.status == 200
+
+    def capture_pathfinder_headers(request) -> None:
+        if request.url != SPOTIFY_WEB_PATHFINDER_URL:
+            return
+        headers = request.headers
+        for key in ("client-token", "spotify-app-version"):
+            value = headers.get(key)
+            if value:
+                captured_headers[key] = value
+
+    page.on("request", capture_pathfinder_headers)
+    try:
+        with page.expect_response(is_token_response, timeout=timeout_ms) as response_info:
+            page.goto(SPOTIFY_WEB_ORIGIN, wait_until="domcontentloaded", timeout=timeout_ms)
+        data = response_info.value.json()
+        if not captured_headers.get("client-token"):
+            try:
+                request = page.wait_for_request(
+                    lambda req: req.url == SPOTIFY_WEB_PATHFINDER_URL and bool(req.headers.get("client-token")),
+                    timeout=5_000,
+                )
+                capture_pathfinder_headers(request)
+            except Exception:
+                pass
+    except Exception as exc:
+        raise RuntimeError("Spotify Web Player token request did not complete from the loaded web app") from exc
+    if not isinstance(data, dict):
+        raise RuntimeError("Spotify Web Player token response was not a JSON object")
+    return SpotifyWebSessionState(
+        access_token=spotify_web_token_from_payload(data),
+        user_agent=_safe_page_user_agent(page),
+        client_token=captured_headers.get("client-token"),
+        app_version=captured_headers.get("spotify-app-version"),
+    )
+
+
+def wait_for_spotify_web_access_token(page, *, timeout_ms: int = 60_000) -> str:
+    return wait_for_spotify_web_session_state(page, timeout_ms=timeout_ms).access_token
+
+
 def ensure_yt_browser_auth_from_session(
     auth_path: Path,
     *,
@@ -406,7 +501,7 @@ def ensure_yt_browser_auth_from_session(
             )
             try:
                 page = context.pages[0] if context.pages else context.new_page()
-                user_agent = str(page.evaluate("navigator.userAgent"))
+                user_agent = _safe_page_user_agent(page)
                 cookie_header = _playwright_cookie_header(context.cookies([YTMUSIC_ORIGIN]))
 
                 if not _cookie_value(cookie_header, YTMUSIC_REQUIRED_COOKIE):
@@ -419,7 +514,7 @@ def ensure_yt_browser_auth_from_session(
                 while not _cookie_value(cookie_header, YTMUSIC_REQUIRED_COOKIE) and time.time() < deadline:
                     page.wait_for_timeout(2_000)
                     cookie_header = _playwright_cookie_header(context.cookies([YTMUSIC_ORIGIN]))
-                    user_agent = str(page.evaluate("navigator.userAgent"))
+                    user_agent = _safe_page_user_agent(page)
 
                 headers = build_yt_browser_auth_headers(cookie_header, user_agent=user_agent)
                 auth_path.write_text(json.dumps(headers, ensure_ascii=True, indent=4, sort_keys=True) + "\n", encoding="utf-8")
@@ -431,6 +526,203 @@ def ensure_yt_browser_auth_from_session(
             "Could not open the persistent YouTube Music browser session. "
             "If this is the first run, install the browser with: uv run playwright install chromium"
         ) from exc
+
+
+def ensure_spotify_web_session_state_from_session(
+    session_dir: Path,
+    *,
+    headless: bool = False,
+    login_timeout_seconds: float = DEFAULT_SPOTIFY_WEB_LOGIN_TIMEOUT,
+) -> SpotifyWebSessionState:
+    """Return Spotify Web Player auth state from a persistent browser profile.
+
+    First run opens open.spotify.com. User logs in once. Later runs reuse session_dir cookies and capture a
+    fresh Web Player access token plus internal Web Player headers from the loaded app.
+    """
+    try:
+        from playwright.sync_api import Error as PlaywrightError
+        from playwright.sync_api import sync_playwright
+    except ImportError as exc:  # pragma: no cover - exercised by integration usage, not unit tests
+        raise RuntimeError(
+            "Spotify web-session auth requires Playwright. Run: uv sync && uv run playwright install chromium"
+        ) from exc
+
+    session_dir.mkdir(parents=True, exist_ok=True)
+    deadline = time.time() + login_timeout_seconds
+
+    try:
+        with sync_playwright() as p:
+            context = p.chromium.launch_persistent_context(
+                str(session_dir),
+                headless=headless,
+                args=["--disable-blink-features=AutomationControlled"],
+            )
+            try:
+                page = context.pages[0] if context.pages else context.new_page()
+                user_agent = _safe_page_user_agent(page)
+                cookie_header = _playwright_cookie_header(context.cookies([SPOTIFY_WEB_ORIGIN]))
+
+                if not _cookie_value(cookie_header, SPOTIFY_WEB_REQUIRED_COOKIE):
+                    page.goto(SPOTIFY_WEB_ORIGIN, wait_until="domcontentloaded", timeout=60_000)
+                    user_agent = _safe_page_user_agent(page)
+                    print(
+                        "Spotify Web Player login required. Complete login in the opened browser window; "
+                        "this browser profile will be reused on future runs.",
+                        file=sys.stderr,
+                    )
+                while not _cookie_value(cookie_header, SPOTIFY_WEB_REQUIRED_COOKIE) and time.time() < deadline:
+                    page.wait_for_timeout(2_000)
+                    cookie_header = _playwright_cookie_header(context.cookies([SPOTIFY_WEB_ORIGIN]))
+                    user_agent = _safe_page_user_agent(page)
+
+                if not _cookie_value(cookie_header, SPOTIFY_WEB_REQUIRED_COOKIE):
+                    raise RuntimeError(
+                        f"Spotify Web Player session is not logged in; missing {SPOTIFY_WEB_REQUIRED_COOKIE}. "
+                        "Complete Spotify login in the opened browser window, then rerun."
+                    )
+
+                state = wait_for_spotify_web_session_state(page)
+                if not state.user_agent:
+                    state = SpotifyWebSessionState(
+                        access_token=state.access_token,
+                        user_agent=user_agent,
+                        client_token=state.client_token,
+                        app_version=state.app_version,
+                    )
+                print(f"Spotify Web Player token refreshed from persistent session: {session_dir}", file=sys.stderr)
+                return state
+            finally:
+                context.close()
+    except PlaywrightError as exc:  # pragma: no cover - depends on local browser installation/display
+        raise RuntimeError(
+            "Could not open the persistent Spotify Web Player browser session. "
+            "If this is the first run, install the browser with: uv run playwright install chromium"
+        ) from exc
+
+
+def ensure_spotify_web_access_token_from_session(
+    session_dir: Path,
+    *,
+    headless: bool = False,
+    login_timeout_seconds: float = DEFAULT_SPOTIFY_WEB_LOGIN_TIMEOUT,
+) -> tuple[str, str]:
+    state = ensure_spotify_web_session_state_from_session(
+        session_dir,
+        headless=headless,
+        login_timeout_seconds=login_timeout_seconds,
+    )
+    return state.access_token, state.user_agent
+
+
+class SpotifyAPIError(RuntimeError):
+    def __init__(self, message: str, *, http_status: int | None = None, headers: dict[str, str] | None = None) -> None:
+        super().__init__(message)
+        self.http_status = http_status
+        self.headers = headers or {}
+
+
+def spotify_api_request_json(
+    method: str,
+    path: str,
+    *,
+    access_token: str,
+    user_agent: str,
+    params: dict[str, str | int] | None = None,
+    payload: dict | None = None,
+):
+    query = urllib.parse.urlencode(params or {})
+    url = f"{SPOTIFY_API_BASE}{path}"
+    if query:
+        url = f"{url}?{query}"
+    data = json.dumps(payload).encode("utf-8") if payload is not None else None
+    headers = {
+        "accept": "application/json",
+        "authorization": f"Bearer {access_token}",
+        "user-agent": user_agent,
+    }
+    if payload is not None:
+        headers["content-type"] = "application/json"
+    request = urllib.request.Request(url, data=data, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(request, timeout=60) as response:
+            raw = response.read()
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="replace")
+        raise SpotifyAPIError(
+            f"Spotify Web API HTTP {exc.code}: {body}",
+            http_status=exc.code,
+            headers=dict(exc.headers.items()),
+        ) from exc
+    if not raw:
+        return {}
+    return json.loads(raw.decode("utf-8"))
+
+
+def spotify_pathfinder_request_json(payload: dict, *, state: SpotifyWebSessionState):
+    headers = {
+        "accept": "application/json",
+        "app-platform": "WebPlayer",
+        "authorization": f"Bearer {state.access_token}",
+        "content-type": "application/json;charset=UTF-8",
+        "origin": SPOTIFY_WEB_ORIGIN,
+        "referer": f"{SPOTIFY_WEB_ORIGIN}/",
+        "user-agent": state.user_agent,
+    }
+    if state.client_token:
+        headers["client-token"] = state.client_token
+    if state.app_version:
+        headers["spotify-app-version"] = state.app_version
+    data = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+    request = urllib.request.Request(SPOTIFY_WEB_PATHFINDER_URL, data=data, headers=headers, method="POST")
+    try:
+        with urllib.request.urlopen(request, timeout=60) as response:
+            raw = response.read()
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="replace")
+        raise SpotifyAPIError(
+            f"Spotify Web Player pathfinder HTTP {exc.code}: {body}",
+            http_status=exc.code,
+            headers=dict(exc.headers.items()),
+        ) from exc
+    parsed = json.loads(raw.decode("utf-8")) if raw else {}
+    if isinstance(parsed, dict) and parsed.get("errors"):
+        raise SpotifyAPIError(f"Spotify Web Player pathfinder returned errors: {parsed.get('errors')}")
+    return parsed
+
+
+def spotify_graphql_track_to_api_track(wrapper: dict) -> dict | None:
+    data = wrapper.get("data") if isinstance(wrapper.get("data"), dict) else wrapper
+    if not isinstance(data, dict) or data.get("__typename") not in {"Track", None}:
+        return None
+    uri = str(wrapper.get("_uri") or data.get("uri") or data.get("_uri") or "")
+    track_id = str(data.get("id") or (uri.split(":")[-1] if uri else ""))
+    name = data.get("name")
+    if not track_id or not name:
+        return None
+    artists = []
+    for artist in ((data.get("artists") or {}).get("items") or []):
+        if isinstance(artist, dict):
+            artist_name = ((artist.get("profile") or {}).get("name") or artist.get("name"))
+            if artist_name:
+                artists.append({"name": artist_name})
+    album_data = data.get("albumOfTrack") or data.get("album") or {}
+    duration = data.get("duration") or {}
+    duration_ms = data.get("duration_ms") or duration.get("totalMilliseconds")
+    return {
+        "id": track_id,
+        "name": name,
+        "artists": artists,
+        "duration_ms": duration_ms,
+        "album": {"name": album_data.get("name")},
+    }
+
+
+def spotify_graphql_library_item_to_api_item(item: dict) -> dict | None:
+    track = item.get("track") if isinstance(item.get("track"), dict) else None
+    if not track:
+        return None
+    parsed = spotify_graphql_track_to_api_track(track)
+    return {"track": parsed} if parsed else None
 
 
 def should_prepare_yt_browser_session(auth_mode: str, auth_path: Path, refresh: bool) -> bool:
@@ -702,6 +994,119 @@ class SyncCache:
             return None
 
 
+class SpotifyWebClient:
+    def __init__(self, token_provider: Callable[[], SpotifyWebSessionState | tuple[str, str]]) -> None:
+        self._token_provider = token_provider
+        self._state = self._normalize_state(token_provider())
+
+    @staticmethod
+    def _normalize_state(state: SpotifyWebSessionState | tuple[str, str]) -> SpotifyWebSessionState:
+        if isinstance(state, SpotifyWebSessionState):
+            return state
+        access_token, user_agent = state
+        return SpotifyWebSessionState(access_token=access_token, user_agent=user_agent)
+
+    def _refresh_token(self) -> None:
+        self._state = self._normalize_state(self._token_provider())
+
+    def _pathfinder(self, payload: dict):
+        try:
+            return spotify_pathfinder_request_json(payload, state=self._state)
+        except SpotifyAPIError as exc:
+            if exc.http_status != 401:
+                raise
+            self._refresh_token()
+            return spotify_pathfinder_request_json(payload, state=self._state)
+
+    def current_user_saved_tracks(self, *, limit: int, offset: int, market: str):
+        del market
+        payload = {
+            "variables": {"offset": offset, "limit": limit},
+            "operationName": "fetchLibraryTracks",
+            "extensions": {
+                "persistedQuery": {
+                    "version": 1,
+                    "sha256Hash": "087278b20b743578a6262c2b0b4bcd20d879c503cc359a2285baf083ef944240",
+                }
+            },
+        }
+        data = self._pathfinder(payload)
+        tracks = (((data.get("data") or {}).get("me") or {}).get("library") or {}).get("tracks") or {}
+        items = []
+        for item in tracks.get("items") or []:
+            parsed = spotify_graphql_library_item_to_api_item(item)
+            if parsed:
+                items.append(parsed)
+        return {"items": items, "total": int(tracks.get("totalCount") or offset + len(items))}
+
+    def search(self, *, q: str, type: str, limit: int, market: str):
+        del market
+        if type != "track":
+            raise ValueError("SpotifyWebClient only supports track search")
+        payload = {
+            "variables": {
+                "query": q,
+                "limit": max(limit, 10),
+                "offset": 0,
+                "numberOfTopResults": max(limit, 10),
+                "includeArtistHasConcertsField": False,
+                "includeAudiobooks": True,
+                "includeAuthors": False,
+                "includePreReleases": True,
+                "includeEpisodeContentRatingsV2": False,
+                "sectionFilters": ["GENERIC", "VIDEO_CONTENT"],
+            },
+            "operationName": "searchTopResultsList",
+            "extensions": {
+                "persistedQuery": {
+                    "version": 1,
+                    "sha256Hash": "75a88491b7c54a02065a24d6e836121ab20ca42d1bede25a0e06fe5018033ffe",
+                }
+            },
+        }
+        data = self._pathfinder(payload)
+        tracks: list[dict] = []
+        self._collect_graphql_tracks(data, tracks)
+        deduped: list[dict] = []
+        seen: set[str] = set()
+        for track in tracks:
+            track_id = str(track.get("id") or "")
+            if track_id and track_id not in seen:
+                seen.add(track_id)
+                deduped.append(track)
+            if len(deduped) >= limit:
+                break
+        return {"tracks": {"items": deduped}}
+
+    @staticmethod
+    def _collect_graphql_tracks(value, tracks: list[dict]) -> None:
+        if isinstance(value, dict):
+            if value.get("__typename") == "TrackResponseWrapper":
+                parsed = spotify_graphql_track_to_api_track(value)
+                if parsed:
+                    tracks.append(parsed)
+                return
+            for child in value.values():
+                SpotifyWebClient._collect_graphql_tracks(child, tracks)
+        elif isinstance(value, list):
+            for child in value:
+                SpotifyWebClient._collect_graphql_tracks(child, tracks)
+
+    def current_user_saved_tracks_add(self, *, tracks: Sequence[str]):
+        uris = [track if str(track).startswith("spotify:track:") else f"spotify:track:{track}" for track in tracks]
+        payload = {
+            "variables": {"libraryItemUris": uris},
+            "operationName": "addToLibrary",
+            "extensions": {
+                "persistedQuery": {
+                    "version": 1,
+                    "sha256Hash": "7c5a69420e2bfae3da5cc4e14cbc8bb3f6090f80afc00ffc179177f19be3f33d",
+                }
+            },
+        }
+        return self._pathfinder(payload)
+
+
 class SpotifyBackend:
     def __init__(
         self,
@@ -713,10 +1118,27 @@ class SpotifyBackend:
         cache_path: str | None = None,
         market: str = DEFAULT_MARKET,
         heartbeat: CommandHeartbeat | None = None,
+        web_session_dir: Path | str = DEFAULT_SPOTIFY_WEB_SESSION_DIR,
+        web_headless: bool = False,
+        web_login_timeout_seconds: float = DEFAULT_SPOTIFY_WEB_LOGIN_TIMEOUT,
     ) -> None:
         self.market = market
         self.heartbeat = heartbeat
         self.mode = self._resolve_auth_mode(auth_mode, client_id, client_secret)
+
+        if self.mode == "web-session":
+            session_dir = Path(web_session_dir).expanduser()
+            if not session_dir.is_absolute():
+                session_dir = Path.cwd() / session_dir
+            self.web_session_dir = session_dir
+            self.client = SpotifyWebClient(
+                lambda: ensure_spotify_web_session_state_from_session(
+                    session_dir,
+                    headless=web_headless,
+                    login_timeout_seconds=web_login_timeout_seconds,
+                )
+            )
+            return
 
         from spotipy import Spotify
         from spotipy.oauth2 import SpotifyOAuth, SpotifyPKCE
@@ -751,7 +1173,7 @@ class SpotifyBackend:
 
     @staticmethod
     def _resolve_auth_mode(auth_mode: str, client_id: str | None, client_secret: str | None) -> str:
-        if auth_mode not in {"auto", "oauth", "pkce"}:
+        if auth_mode not in {"auto", "oauth", "pkce", "web-session"}:
             raise ValueError(f"unsupported Spotify auth backend: {auth_mode}")
         if auth_mode != "auto":
             return auth_mode
@@ -985,11 +1407,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--yt-browser-login-timeout", type=non_negative_float, default=float(os.environ.get("YTMUSIC_BROWSER_LOGIN_TIMEOUT", DEFAULT_YT_BROWSER_LOGIN_TIMEOUT)), help="seconds to wait for first-time YouTube Music browser login")
     parser.add_argument("--yt-refresh-browser-auth", action="store_true", help="refresh auth/browser.json from the persistent browser session before syncing")
     parser.add_argument("--yt-client-secret", default=os.environ.get("YTMUSIC_CLIENT_SECRET"))
-    parser.add_argument("--spotify-auth", choices=("auto", "oauth", "pkce"), default=os.environ.get("SPOTIFY_AUTH") or spotify_config.get("auth", "auto"), help="Spotify auth backend: oauth uses client secret, pkce uses client ID only")
+    parser.add_argument("--spotify-auth", choices=("auto", "oauth", "pkce", "web-session"), default=os.environ.get("SPOTIFY_AUTH") or spotify_config.get("auth", "auto"), help="Spotify auth backend: web-session reuses Spotify Web Player browser login, oauth uses client secret, pkce uses client ID only")
     parser.add_argument("--spotify-client-id", default=os.environ.get("SPOTIFY_CLIENT_ID") or os.environ.get("SPOTIPY_CLIENT_ID") or spotify_config.get("client_id"))
     parser.add_argument("--spotify-client-secret", default=os.environ.get("SPOTIFY_CLIENT_SECRET") or os.environ.get("SPOTIPY_CLIENT_SECRET") or spotify_config.get("client_secret"))
     parser.add_argument("--spotify-redirect-uri", default=os.environ.get("SPOTIFY_REDIRECT_URI") or os.environ.get("SPOTIPY_REDIRECT_URI") or spotify_config.get("redirect_uri") or "http://127.0.0.1:8888/callback")
     parser.add_argument("--spotify-cache", default=os.environ.get("SPOTIFY_TOKEN_CACHE") or spotify_config.get("cache", ".cache-spotify"), help="Spotipy OAuth token cache path")
+    parser.add_argument("--spotify-web-session-dir", default=os.environ.get("SPOTIFY_WEB_SESSION_DIR") or spotify_config.get("web_session_dir", DEFAULT_SPOTIFY_WEB_SESSION_DIR), help="persistent browser profile used for Spotify Web Player login/session reuse")
+    parser.add_argument("--spotify-web-headless", action="store_true", default=config_bool(os.environ.get("SPOTIFY_WEB_HEADLESS") or spotify_config.get("web_headless")), help="run the Spotify Web Player browser session headless after first login is complete")
+    parser.add_argument("--spotify-web-login-timeout", type=non_negative_float, default=float(os.environ.get("SPOTIFY_WEB_LOGIN_TIMEOUT") or spotify_config.get("web_login_timeout", DEFAULT_SPOTIFY_WEB_LOGIN_TIMEOUT)), help="seconds to wait for first-time Spotify Web Player login")
     parser.add_argument("--market", default=os.environ.get("MUSIC_SYNC_MARKET", DEFAULT_MARKET), help="Spotify market code used for search/library reads")
     parser.add_argument("--apply", action="store_true", help="actually save/like matched tracks; default is dry-run")
     parser.add_argument("--max-add", type=positive_int, default=None, help="optional cap on tracks to add per direction; default processes all missing tracks")
@@ -1037,15 +1462,22 @@ def main(argv: Sequence[str] | None = None) -> int:
         timeout_seconds=args.heartbeat_timeout,
     )
 
-    spotify = SpotifyBackend(
-        auth_mode=args.spotify_auth,
-        client_id=args.spotify_client_id,
-        client_secret=args.spotify_client_secret,
-        redirect_uri=args.spotify_redirect_uri,
-        cache_path=args.spotify_cache,
-        market=args.market,
-        heartbeat=heartbeat,
-    )
+    try:
+        spotify = SpotifyBackend(
+            auth_mode=args.spotify_auth,
+            client_id=args.spotify_client_id,
+            client_secret=args.spotify_client_secret,
+            redirect_uri=args.spotify_redirect_uri,
+            cache_path=args.spotify_cache,
+            market=args.market,
+            heartbeat=heartbeat,
+            web_session_dir=args.spotify_web_session_dir,
+            web_headless=args.spotify_web_headless,
+            web_login_timeout_seconds=args.spotify_web_login_timeout,
+        )
+    except RuntimeError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
     cache_path = Path(args.cache_db).expanduser()
     if not cache_path.is_absolute():
         cache_path = Path.cwd() / cache_path
@@ -1092,6 +1524,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         "yt_auth": ytm.mode,
         "yt_auth_requested": args.yt_auth,
         "yt_browser_session_dir": str(yt_browser_session_dir),
+        "spotify_auth": getattr(spotify, "mode", args.spotify_auth),
+        "spotify_auth_requested": args.spotify_auth,
+        "spotify_web_session_dir": str(Path(args.spotify_web_session_dir).expanduser()),
         "cache_db": str(cache_path),
         "cache_read": bool(args.cache_read),
         "cache_write": bool(args.cache_write),
@@ -1189,6 +1624,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         "yt_auth": ytm.mode,
         "yt_auth_requested": args.yt_auth,
         "yt_browser_session_dir": str(yt_browser_session_dir),
+        "spotify_auth": getattr(spotify, "mode", args.spotify_auth),
+        "spotify_auth_requested": args.spotify_auth,
+        "spotify_web_session_dir": str(Path(args.spotify_web_session_dir).expanduser()),
         "cache_db": str(cache_path),
         "cache_read": bool(args.cache_read),
         "cache_write": bool(args.cache_write),

@@ -15,8 +15,8 @@ The tool is conservative by design:
 
 - Python 3.11+
 - [`uv`](https://docs.astral.sh/uv/)
-- Spotify Developer app credentials
-- Google Cloud OAuth client for YouTube Data API, type **TVs and Limited Input devices**, or browser-header auth from `music.youtube.com`
+- Spotify Web Player login, or Spotify Developer app credentials for OAuth/PKCE
+- Google Cloud OAuth client for YouTube Data API, or persistent browser-session auth from `music.youtube.com`
 
 ## Install
 
@@ -28,7 +28,29 @@ uv sync --all-groups
 
 ## Spotify auth setup
 
-Yes, Spotify OAuth is supported.
+### Option A: Persistent Spotify Web Player session
+
+This is the preferred path for long personal sync runs when OAuth/PKCE is rate-limited. It opens a real Chromium window at `open.spotify.com`, you log in once, and the browser profile is reused from `auth/spotify-web-session/`. The script mints short-lived Web Player access tokens from that session; no Spotify app/client ID is required for this mode.
+
+First run:
+
+```bash
+uv run playwright install chromium
+uv run python src/music_liked_sync.py --spotify-auth web-session
+```
+
+Later runs reuse the same browser profile. For local/default runs, you can set this in `auth/spotify.json` (gitignored):
+
+```json
+{
+  "auth": "web-session",
+  "web_session_dir": "auth/spotify-web-session"
+}
+```
+
+### Option B: Spotify OAuth/PKCE
+
+Spotify OAuth/PKCE is still supported.
 
 Create an app at <https://developer.spotify.com/dashboard>, add this redirect URI:
 
@@ -185,12 +207,15 @@ uv run python src/music_liked_sync.py --ytm-to-spotify --apply
 ## Options
 
 ```text
---spotify-auth {auto,oauth,pkce}
+--spotify-auth {auto,oauth,pkce,web-session}
 --spotify-client-id VALUE
 --spotify-client-secret VALUE
 --spotify-redirect-uri VALUE
 --spotify-cache PATH
---yt-auth {auto,oauth,browser}
+--spotify-web-session-dir auth/spotify-web-session
+--spotify-web-headless
+--spotify-web-login-timeout 300
+--yt-auth {auto,oauth,browser,browser-session}
 --yt-auth-file PATH              # YouTube Music oauth.json or browser headers JSON
 --oauth PATH                    # backwards-compatible alias for --yt-auth-file
 --yt-client-id VALUE            # OAuth mode only
@@ -207,7 +232,7 @@ uv run python src/music_liked_sync.py --ytm-to-spotify --apply
 --apply
 ```
 
-Most users should use `--spotify-auth oauth`, `--spotify-auth pkce`, or default `auto`.
+Most users should use `--spotify-auth web-session` for long personal sync runs, or `--spotify-auth oauth` / `--spotify-auth pkce` for standard Spotify app auth.
 Use `pkce` when you only have a Spotify Client ID and no client secret:
 
 ```bash
