@@ -4,6 +4,7 @@ version = "0.1.1"
 description = "Bidirectional Spotify and YouTube Music liked songs sync"
 requires-python = ">=3.11"
 dependencies = [
+  "playwright>=1.49.0",
   "spotipy>=2.25.0",
   "ytmusicapi>=1.11.5",
 ]

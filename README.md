@@ -95,29 +95,33 @@ export YTMUSIC_CLIENT_SECRET='<youtube-client-secret>'
 
 If OAuth returns `HTTP 400: Bad Request. Request contains an invalid argument`, use browser auth instead.
 
-### Option B: Browser headers
+### Option B: Persistent browser session
 
-This is the more reliable fallback when YouTube Music rejects OAuth requests.
+This is the default and the preferred path when YouTube Music rejects OAuth.
+
+First run:
 
 ```bash
-mkdir -p auth
-uv run ytmusicapi browser --file auth/browser.json
+uv run playwright install chromium
+uv run python src/music_liked_sync.py --yt-auth browser-session
 ```
 
-Paste raw request headers copied from a logged-in `music.youtube.com/youtubei/v1/browse` request.
-The headers must include `cookie`, `authorization`, and `x-goog-authuser`.
+A real Chromium window opens at `music.youtube.com`. Log in once. The browser profile is stored under `auth/ytmusic-browser-session/`, and `auth/browser.json` is generated from that live session. Later runs reuse the same browser session and do not require pasted request headers or re-login.
 
-Then run with:
+Force-refresh `auth/browser.json` from the persisted session:
 
 ```bash
+uv run python src/music_liked_sync.py --yt-auth browser-session --yt-refresh-browser-auth
+```
+
+Manual pasted browser headers still work if needed:
+
+```bash
+uv run ytmusicapi browser --file auth/browser.json
 uv run python src/music_liked_sync.py --yt-auth browser --yt-auth-file auth/browser.json
 ```
 
-When neither `YTMUSIC_AUTH_FILE` nor `YTMUSIC_OAUTH` is set, the default auth file is `auth/browser.json` if it exists, otherwise `auth/oauth.json`.
-
-If a browser-auth run says the account is signed out or auth appears expired, regenerate `auth/browser.json` with fresh headers from a logged-in `music.youtube.com` session.
-
-`auth/` is gitignored because it contains tokens/cookies.
+`auth/` is gitignored because it contains browser profiles, tokens, cookies, and generated auth headers.
 
 ## Dry-run
 

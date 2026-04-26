@@ -10,13 +10,16 @@ import json
 import os
 import re
 import sqlite3
+import subprocess
 import sys
 import time
 import unicodedata
+from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from difflib import SequenceMatcher
+from hashlib import sha1
+from http.cookies import SimpleCookie
 from pathlib import Path
-from collections.abc import Callable
 from typing import Iterable, Sequence
 
 COMMON_TITLE_SUFFIX_RE = re.compile(
@@ -32,8 +35,19 @@ DEFAULT_BATCH_DELAY = 1.0
 DEFAULT_CACHE_DB = "state/sync-cache.sqlite3"
 DEFAULT_LIBRARY_CACHE_TTL = 0.0
 DEFAULT_SPOTIFY_CONFIG = "auth/spotify.json"
+DEFAULT_YT_BROWSER_AUTH_FILE = "auth/browser.json"
+DEFAULT_YT_BROWSER_SESSION_DIR = "auth/ytmusic-browser-session"
+YTMUSIC_ORIGIN = "https://music.youtube.com"
+YTMUSIC_REQUIRED_COOKIE = "__Secure-3PAPISID"
+DEFAULT_YT_BROWSER_LOGIN_TIMEOUT = 300.0
+DEFAULT_HEARTBEAT_INTERVAL = 20.0
+DEFAULT_HEARTBEAT_TIMEOUT = 15.0
+SPOTIFY_RETRY_ATTEMPTS = 5
+SPOTIFY_RETRY_BASE_DELAY = 2.0
+SPOTIFY_MAX_RETRY_AFTER = 30.0
 YTM_RETRY_ATTEMPTS = 4
 YTM_RETRY_BASE_DELAY = 2.0
+ARTIST_SPLIT_RE = re.compile(r"\s*(?:,|/|&| x | and | feat\.? | ft\.? | featuring )\s*", re.IGNORECASE)
 
 
 @dataclass(frozen=True)
@@ -151,6 +165,46 @@ def parse_ytm_track(item: dict) -> Track | None:
     return Track(title=title, artists=tuple(artists), source_id=video_id, duration_ms=duration_ms, album=(item.get("album") or {}).get("name") if isinstance(item.get("album"), dict) else None)
 
 
+def primary_search_artist(artists: Sequence[str]) -> str:
+    for artist in artists:
+        for part in ARTIST_SPLIT_RE.split(artist):
+            cleaned = part.strip(" -")
+            if cleaned:
+                return cleaned
+    return ""
+
+
+def truncate_query(query: str, limit: int = 240) -> str:
+    query = re.sub(r"\s+", " ", query).strip()
+    if len(query) <= limit:
+        return query
+    truncated = query[:limit].rsplit(" ", 1)[0].strip()
+    return truncated or query[:limit]
+
+
+def build_spotify_search_queries(wanted: Track) -> list[str]:
+    seen: set[str] = set()
+    queries: list[str] = []
+    title = wanted.title.strip()
+    primary_artist = primary_search_artist(wanted.artists)
+    candidates = [
+        f"track:{title} artist:{primary_artist}" if title and primary_artist else "",
+        f"track:{title}" if title else "",
+        f"{title} {primary_artist}".strip(),
+        title,
+    ]
+    for candidate in candidates:
+        query = truncate_query(candidate)
+        if query and query not in seen:
+            seen.add(query)
+            queries.append(query)
+    return queries
+
+
+def is_spotify_query_too_long_error(exc: BaseException) -> bool:
+    return "query exceeds maximum length" in str(exc).lower()
+
+
 def unique_by_key(tracks: Iterable[Track]) -> dict[str, Track]:
     out: dict[str, Track] = {}
     for track in tracks:
@@ -170,6 +224,54 @@ def non_negative_float(value: str) -> float:
     if parsed < 0:
         raise argparse.ArgumentTypeError("must be >= 0")
     return parsed
+
+
+class CommandHeartbeat:
+    def __init__(
+        self,
+        command: str | None,
+        *,
+        interval_seconds: float = DEFAULT_HEARTBEAT_INTERVAL,
+        timeout_seconds: float = DEFAULT_HEARTBEAT_TIMEOUT,
+        run_fn: Callable[..., object] = subprocess.run,
+        time_fn: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self.command = (command or "").strip()
+        self.interval_seconds = interval_seconds
+        self.timeout_seconds = timeout_seconds
+        self._run_fn = run_fn
+        self._time_fn = time_fn
+        self._last_sent_at = 0.0
+
+    @property
+    def enabled(self) -> bool:
+        return bool(self.command) and self.interval_seconds > 0
+
+    def maybe_beat(self, *, force: bool = False) -> None:
+        if not self.enabled:
+            return
+        now = self._time_fn()
+        if not force and self._last_sent_at and (now - self._last_sent_at) < self.interval_seconds:
+            return
+        self._last_sent_at = now
+        try:
+            result = self._run_fn(
+                self.command,
+                shell=True,
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=self.timeout_seconds,
+            )
+        except Exception as exc:
+            print(f"heartbeat command failed: {exc}", file=sys.stderr)
+            return
+        if getattr(result, "returncode", 1) != 0:
+            detail = ((getattr(result, "stderr", "") or getattr(result, "stdout", "") or "").strip().splitlines() or [""])[0]
+            if detail:
+                print(f"heartbeat command failed with exit {result.returncode}: {detail}", file=sys.stderr)
+            else:
+                print(f"heartbeat command failed with exit {result.returncode}", file=sys.stderr)
 
 
 def batched(items: Sequence, batch_size: int) -> list[Sequence]:
@@ -200,10 +302,7 @@ def default_yt_auth_file() -> str:
     explicit = os.environ.get("YTMUSIC_AUTH_FILE") or os.environ.get("YTMUSIC_OAUTH")
     if explicit:
         return explicit
-    browser_path = Path("auth/browser.json")
-    if browser_path.exists():
-        return str(browser_path)
-    return "auth/oauth.json"
+    return DEFAULT_YT_BROWSER_AUTH_FILE
 
 
 def load_spotify_config(path: Path | str | None = None) -> dict[str, str]:
@@ -215,15 +314,143 @@ def load_spotify_config(path: Path | str | None = None) -> dict[str, str]:
     return {key: str(value) for key, value in data.items() if key in allowed and value}
 
 
-def is_ytm_signed_out_error(exc: BaseException) -> bool:
+def _cookie_value(cookie_header: str, name: str) -> str | None:
+    cookie = SimpleCookie()
+    try:
+        cookie.load(cookie_header.replace('"', ""))
+    except Exception:
+        return None
+    morsel = cookie.get(name)
+    return morsel.value if morsel else None
+
+
+def yt_sapisid_authorization(cookie_header: str, origin: str = YTMUSIC_ORIGIN, timestamp: int | None = None) -> str:
+    sapisid = _cookie_value(cookie_header, YTMUSIC_REQUIRED_COOKIE)
+    if not sapisid:
+        raise RuntimeError(
+            f"YouTube Music browser session is not logged in; missing {YTMUSIC_REQUIRED_COOKIE}. "
+            "Complete Google/YouTube Music login in the opened browser tab, then rerun."
+        )
+    unix_timestamp = str(int(timestamp if timestamp is not None else time.time()))
+    digest = sha1(f"{unix_timestamp} {sapisid} {origin}".encode("utf-8")).hexdigest()
+    return f"SAPISIDHASH {unix_timestamp}_{digest}"
+
+
+def build_yt_browser_auth_headers(
+    cookie_header: str,
+    *,
+    user_agent: str,
+    origin: str = YTMUSIC_ORIGIN,
+    authuser: str = "0",
+    timestamp: int | None = None,
+) -> dict[str, str]:
+    if not cookie_header.strip():
+        raise RuntimeError("YouTube Music browser session has no cookies; login did not complete.")
+    authorization = yt_sapisid_authorization(cookie_header, origin=origin, timestamp=timestamp)
+    return {
+        "accept": "*/*",
+        "content-type": "application/json",
+        "content-encoding": "gzip",
+        "origin": origin,
+        "x-origin": origin,
+        "referer": f"{origin}/",
+        "user-agent": user_agent,
+        "x-goog-authuser": authuser,
+        "cookie": cookie_header,
+        "authorization": authorization,
+    }
+
+
+def _playwright_cookie_header(cookies: Sequence[dict]) -> str:
+    # context.cookies([music.youtube.com]) already returns only cookies applicable to that URL.
+    # Sort for deterministic auth/browser.json diffs and tests.
+    pairs = []
+    for cookie in sorted(cookies, key=lambda item: (str(item.get("name", "")), str(item.get("domain", "")))):
+        name = str(cookie.get("name", "")).strip()
+        value = str(cookie.get("value", ""))
+        if name:
+            pairs.append(f"{name}={value}")
+    return "; ".join(pairs)
+
+
+def ensure_yt_browser_auth_from_session(
+    auth_path: Path,
+    *,
+    session_dir: Path,
+    headless: bool = False,
+    login_timeout_seconds: float = DEFAULT_YT_BROWSER_LOGIN_TIMEOUT,
+) -> None:
+    """Create/refresh ytmusicapi browser auth from a persistent real browser session.
+
+    First run opens a Chromium window using session_dir as the user-data dir. The user logs in once.
+    Later runs reuse that browser profile and refresh auth/browser.json from live cookies without pasted headers.
+    """
+    try:
+        from playwright.sync_api import Error as PlaywrightError
+        from playwright.sync_api import sync_playwright
+    except ImportError as exc:  # pragma: no cover - exercised by integration usage, not unit tests
+        raise RuntimeError(
+            "YouTube browser-session auth requires Playwright. Run: uv sync && uv run playwright install chromium"
+        ) from exc
+
+    auth_path.parent.mkdir(parents=True, exist_ok=True)
+    session_dir.mkdir(parents=True, exist_ok=True)
+    deadline = time.time() + login_timeout_seconds
+
+    try:
+        with sync_playwright() as p:
+            context = p.chromium.launch_persistent_context(
+                str(session_dir),
+                headless=headless,
+                args=["--disable-blink-features=AutomationControlled"],
+            )
+            try:
+                page = context.pages[0] if context.pages else context.new_page()
+                user_agent = str(page.evaluate("navigator.userAgent"))
+                cookie_header = _playwright_cookie_header(context.cookies([YTMUSIC_ORIGIN]))
+
+                if not _cookie_value(cookie_header, YTMUSIC_REQUIRED_COOKIE):
+                    page.goto(YTMUSIC_ORIGIN, wait_until="domcontentloaded", timeout=60_000)
+                    print(
+                        "YouTube Music login required. Complete login in the opened browser window; "
+                        "this browser profile will be reused on future runs.",
+                        file=sys.stderr,
+                    )
+                while not _cookie_value(cookie_header, YTMUSIC_REQUIRED_COOKIE) and time.time() < deadline:
+                    page.wait_for_timeout(2_000)
+                    cookie_header = _playwright_cookie_header(context.cookies([YTMUSIC_ORIGIN]))
+                    user_agent = str(page.evaluate("navigator.userAgent"))
+
+                headers = build_yt_browser_auth_headers(cookie_header, user_agent=user_agent)
+                auth_path.write_text(json.dumps(headers, ensure_ascii=True, indent=4, sort_keys=True) + "\n", encoding="utf-8")
+                print(f"YouTube Music browser auth refreshed from persistent session: {auth_path}", file=sys.stderr)
+            finally:
+                context.close()
+    except PlaywrightError as exc:  # pragma: no cover - depends on local browser installation/display
+        raise RuntimeError(
+            "Could not open the persistent YouTube Music browser session. "
+            "If this is the first run, install the browser with: uv run playwright install chromium"
+        ) from exc
+
+
+def should_prepare_yt_browser_session(auth_mode: str, auth_path: Path, refresh: bool) -> bool:
+    if refresh or auth_mode == "browser-session":
+        return True
+    return auth_mode == "auto" and auth_path.name == "browser.json" and not auth_path.exists()
+
+
+def is_ytm_auth_error(exc: BaseException) -> bool:
     message = str(exc).lower()
-    return "sign in" in message and ("liked" in message or "tracks" in message)
+    signed_out = "sign in" in message and ("liked" in message or "tracks" in message or "operation" in message)
+    unauthorized = "http 401" in message or "unauthorized" in message
+    return signed_out or (unauthorized and "signed in" in message)
 
 
 def ytm_auth_expired_message() -> str:
     return (
-        "YouTube Music auth appears expired or signed out. "
-        "Regenerate auth/browser.json with: uv run ytmusicapi browser --file auth/browser.json"
+        "YouTube Music auth appears expired or signed out. Refresh it from the persistent browser session: "
+        "uv run python src/music_liked_sync.py --yt-auth browser-session --yt-refresh-browser-auth. "
+        "First run opens a real browser window; log in once and the session is reused after that."
     )
 
 
@@ -240,7 +467,7 @@ def retry_ytm_call(
         try:
             return fn()
         except KeyError as exc:
-            if is_ytm_signed_out_error(exc):
+            if is_ytm_auth_error(exc):
                 raise RuntimeError(ytm_auth_expired_message()) from exc
             raise
         except json.JSONDecodeError as exc:
@@ -250,6 +477,64 @@ def retry_ytm_call(
             delay = base_delay * attempt
             print(
                 f"{label}: transient non-JSON response from YouTube Music; retry {attempt}/{attempts - 1} in {delay:.1f}s",
+                file=sys.stderr,
+            )
+            sleep_fn(delay)
+        except Exception as exc:
+            if is_ytm_auth_error(exc):
+                raise RuntimeError(ytm_auth_expired_message()) from exc
+            raise
+    if last_exc:
+        raise last_exc
+
+
+def spotify_retry_delay_seconds(
+    exc: BaseException,
+    attempt: int,
+    *,
+    base_delay: float = SPOTIFY_RETRY_BASE_DELAY,
+    max_retry_after: float = SPOTIFY_MAX_RETRY_AFTER,
+) -> float:
+    headers = getattr(exc, "headers", {}) or {}
+    retry_after = headers.get("Retry-After")
+    if retry_after is not None:
+        try:
+            parsed = float(retry_after)
+        except (TypeError, ValueError):
+            parsed = None
+        if parsed is not None and parsed >= 0:
+            return min(parsed, max_retry_after)
+    return min(base_delay * attempt, max_retry_after)
+
+
+def is_spotify_transient_error(exc: BaseException) -> bool:
+    return getattr(exc, "http_status", None) in {429, 500, 502, 503, 504}
+
+
+def retry_spotify_call(
+    fn,
+    *,
+    label: str,
+    attempts: int = SPOTIFY_RETRY_ATTEMPTS,
+    base_delay: float = SPOTIFY_RETRY_BASE_DELAY,
+    max_retry_after: float = SPOTIFY_MAX_RETRY_AFTER,
+    sleep_fn: Callable[[float], None] = time.sleep,
+):
+    last_exc: Exception | None = None
+    for attempt in range(1, attempts + 1):
+        try:
+            return fn()
+        except Exception as exc:
+            if is_spotify_query_too_long_error(exc):
+                raise
+            if not is_spotify_transient_error(exc):
+                raise
+            last_exc = exc
+            if attempt >= attempts:
+                raise
+            delay = spotify_retry_delay_seconds(exc, attempt, base_delay=base_delay, max_retry_after=max_retry_after)
+            print(
+                f"{label}: transient Spotify error {getattr(exc, 'http_status', 'unknown')}; retry {attempt}/{attempts - 1} in {delay:.1f}s",
                 file=sys.stderr,
             )
             sleep_fn(delay)
@@ -427,8 +712,10 @@ class SpotifyBackend:
         redirect_uri: str | None = None,
         cache_path: str | None = None,
         market: str = DEFAULT_MARKET,
+        heartbeat: CommandHeartbeat | None = None,
     ) -> None:
         self.market = market
+        self.heartbeat = heartbeat
         self.mode = self._resolve_auth_mode(auth_mode, client_id, client_secret)
 
         from spotipy import Spotify
@@ -460,7 +747,7 @@ class SpotifyBackend:
                 open_browser=True,
             )
         )
-        self.client = Spotify(auth_manager=auth_manager)
+        self.client = Spotify(auth_manager=auth_manager, retries=0, status_retries=0, backoff_factor=0)
 
     @staticmethod
     def _resolve_auth_mode(auth_mode: str, client_id: str | None, client_secret: str | None) -> str:
@@ -482,7 +769,13 @@ class SpotifyBackend:
         tracks: list[Track] = []
         offset = 0
         while True:
-            page = self.client.current_user_saved_tracks(limit=50, offset=offset, market=self.market)
+            heartbeat = getattr(self, "heartbeat", None)
+            if heartbeat:
+                heartbeat.maybe_beat()
+            page = retry_spotify_call(
+                lambda offset=offset: self.client.current_user_saved_tracks(limit=50, offset=offset, market=self.market),
+                label="Spotify current_user_saved_tracks",
+            )
             items = page.get("items", []) or []
             for item in items:
                 parsed = parse_spotify_track(item)
@@ -494,10 +787,24 @@ class SpotifyBackend:
         return tracks
 
     def search_track(self, wanted: Track, limit: int = 5) -> list[Track]:
-        query = f"track:{wanted.title} artist:{' '.join(wanted.artists[:1])}" if wanted.artists else wanted.title
-        page = self.client.search(q=query, type="track", limit=limit, market=self.market)
-        items = ((page.get("tracks") or {}).get("items") or [])
-        return [t for t in (parse_spotify_track(item) for item in items) if t]
+        for query in build_spotify_search_queries(wanted):
+            heartbeat = getattr(self, "heartbeat", None)
+            if heartbeat:
+                heartbeat.maybe_beat()
+            try:
+                page = retry_spotify_call(
+                    lambda query=query: self.client.search(q=query, type="track", limit=limit, market=self.market),
+                    label="Spotify search",
+                )
+            except Exception as exc:
+                if is_spotify_query_too_long_error(exc):
+                    continue
+                raise
+            items = ((page.get("tracks") or {}).get("items") or [])
+            tracks = [t for t in (parse_spotify_track(item) for item in items) if t]
+            if tracks:
+                return tracks
+        return []
 
     def save_tracks(
         self,
@@ -511,7 +818,13 @@ class SpotifyBackend:
         effective_batch_size = min(batch_size, 50)  # Spotify save-tracks endpoint accepts max 50 IDs.
         chunks = batched(ids, effective_batch_size)
         for index, chunk in enumerate(chunks):
-            self.client.current_user_saved_tracks_add(tracks=chunk)
+            heartbeat = getattr(self, "heartbeat", None)
+            if heartbeat:
+                heartbeat.maybe_beat()
+            retry_spotify_call(
+                lambda chunk=chunk: self.client.current_user_saved_tracks_add(tracks=chunk),
+                label="Spotify current_user_saved_tracks_add",
+            )
             sleep_between_batches(index, len(chunks), batch_delay, sleep_fn)
 
 
@@ -522,6 +835,7 @@ class YTMusicBackend:
         client_id: str | None,
         client_secret: str | None,
         auth_mode: str = "auto",
+        heartbeat: CommandHeartbeat | None = None,
     ) -> None:
         from ytmusicapi import YTMusic
         from ytmusicapi.auth.oauth import OAuthCredentials
@@ -529,6 +843,7 @@ class YTMusicBackend:
         if not auth_path.exists():
             raise FileNotFoundError(f"YouTube Music auth file missing: {auth_path}")
 
+        self.heartbeat = heartbeat
         self.mode = self.resolve_auth_mode(auth_mode, auth_path, client_id, client_secret)
         creds = None
         if self.mode == "oauth" and client_id and client_secret:
@@ -559,6 +874,9 @@ class YTMusicBackend:
         return "browser"
 
     def liked_tracks(self, limit: int | None = None) -> list[Track]:
+        heartbeat = getattr(self, "heartbeat", None)
+        if heartbeat:
+            heartbeat.maybe_beat(force=True)
         result = retry_ytm_call(
             lambda: self.client.get_liked_songs(limit=limit or 10000),
             label="YTM get_liked_songs",
@@ -568,6 +886,9 @@ class YTMusicBackend:
 
     def search_track(self, wanted: Track, limit: int = 5) -> list[Track]:
         query = f"{wanted.title} {' '.join(wanted.artists)}".strip()
+        heartbeat = getattr(self, "heartbeat", None)
+        if heartbeat:
+            heartbeat.maybe_beat()
         items = retry_ytm_call(
             lambda: self.client.search(query, filter="songs", limit=limit) or [],
             label="YTM search",
@@ -585,6 +906,9 @@ class YTMusicBackend:
         chunks = batched(tracks, batch_size)
         for index, chunk in enumerate(chunks):
             for track in chunk:
+                heartbeat = getattr(self, "heartbeat", None)
+                if heartbeat:
+                    heartbeat.maybe_beat()
                 retry_ytm_call(
                     lambda track_id=track.source_id: self.client.rate_song(track_id, "LIKE"),
                     label=f"YTM rate_song {track.source_id}",
@@ -610,6 +934,7 @@ def resolve_matches(
     cache_direction: str | None = None,
     cache_read: bool = True,
     cache_write: bool = True,
+    heartbeat: CommandHeartbeat | None = None,
 ) -> tuple[list[tuple[Track, Track]], list[Track]]:
     matched: list[tuple[Track, Track]] = []
     unmatched: list[Track] = []
@@ -617,6 +942,8 @@ def resolve_matches(
     chunks = batched(candidates_to_process, batch_size)
     for batch_index, chunk in enumerate(chunks):
         for wanted in chunk:
+            if heartbeat:
+                heartbeat.maybe_beat()
             cached_match = None
             if cache and cache_direction and cache_read:
                 cached_match = cache.get_match(cache_direction, wanted)
@@ -624,7 +951,16 @@ def resolve_matches(
                 matched.append((wanted, cached_match))
                 print(f"{label}: {len(matched)} matched, {len(unmatched)} unmatched", end="\r", flush=True)
                 continue
-            candidates = search_fn(wanted)
+            try:
+                candidates = search_fn(wanted)
+            except RuntimeError:
+                raise
+            except Exception as exc:
+                summary = str(exc).strip().splitlines()[0][:180] if str(exc).strip() else exc.__class__.__name__
+                print(f"{label}: search failed for {wanted.display}; treating as unresolved ({summary})", file=sys.stderr)
+                unmatched.append(wanted)
+                print(f"{label}: {len(matched)} matched, {len(unmatched)} unmatched", end="\r", flush=True)
+                continue
             match = best_match(wanted, candidates)
             if match:
                 matched.append((wanted, match))
@@ -641,9 +977,13 @@ def resolve_matches(
 def build_arg_parser() -> argparse.ArgumentParser:
     spotify_config = load_spotify_config()
     parser = argparse.ArgumentParser(description="Sync Spotify and YouTube Music liked songs")
-    parser.add_argument("--yt-auth", choices=("auto", "oauth", "browser"), default=os.environ.get("YTMUSIC_AUTH", "auto"), help="YouTube Music auth type; auto detects oauth.json vs browser headers JSON")
+    parser.add_argument("--yt-auth", choices=("auto", "oauth", "browser", "browser-session"), default=os.environ.get("YTMUSIC_AUTH", "browser-session"), help="YouTube Music auth type; browser-session opens/reuses a persistent browser profile and writes browser headers JSON")
     parser.add_argument("--yt-auth-file", "--oauth", dest="yt_auth_file", default=default_yt_auth_file(), help="YouTube Music auth JSON path; --oauth is kept as a backwards-compatible alias")
     parser.add_argument("--yt-client-id", default=os.environ.get("YTMUSIC_CLIENT_ID"))
+    parser.add_argument("--yt-browser-session-dir", default=os.environ.get("YTMUSIC_BROWSER_SESSION_DIR", DEFAULT_YT_BROWSER_SESSION_DIR), help="persistent browser profile used for YouTube Music login/session reuse")
+    parser.add_argument("--yt-browser-headless", action="store_true", help="run the YouTube Music browser session headless after first login is complete")
+    parser.add_argument("--yt-browser-login-timeout", type=non_negative_float, default=float(os.environ.get("YTMUSIC_BROWSER_LOGIN_TIMEOUT", DEFAULT_YT_BROWSER_LOGIN_TIMEOUT)), help="seconds to wait for first-time YouTube Music browser login")
+    parser.add_argument("--yt-refresh-browser-auth", action="store_true", help="refresh auth/browser.json from the persistent browser session before syncing")
     parser.add_argument("--yt-client-secret", default=os.environ.get("YTMUSIC_CLIENT_SECRET"))
     parser.add_argument("--spotify-auth", choices=("auto", "oauth", "pkce"), default=os.environ.get("SPOTIFY_AUTH") or spotify_config.get("auth", "auto"), help="Spotify auth backend: oauth uses client secret, pkce uses client ID only")
     parser.add_argument("--spotify-client-id", default=os.environ.get("SPOTIFY_CLIENT_ID") or os.environ.get("SPOTIPY_CLIENT_ID") or spotify_config.get("client_id"))
@@ -659,6 +999,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--cache-library-ttl", type=non_negative_float, default=float(os.environ.get("MUSIC_SYNC_LIBRARY_CACHE_TTL", DEFAULT_LIBRARY_CACHE_TTL)), help="seconds to reuse cached liked libraries; 0 disables library reuse")
     parser.add_argument("--no-cache-read", dest="cache_read", action="store_false", help="disable reading cached matches/library")
     parser.add_argument("--no-cache-write", dest="cache_write", action="store_false", help="disable writing cache")
+    parser.add_argument("--heartbeat-command", default=os.environ.get("MUSIC_SYNC_HEARTBEAT_COMMAND"), help="optional shell command to keep the YouTube Music session warm during long runs")
+    parser.add_argument("--heartbeat-interval", type=non_negative_float, default=float(os.environ.get("MUSIC_SYNC_HEARTBEAT_INTERVAL", DEFAULT_HEARTBEAT_INTERVAL)), help="minimum seconds between heartbeat command runs; 0 disables heartbeat")
+    parser.add_argument("--heartbeat-timeout", type=non_negative_float, default=float(os.environ.get("MUSIC_SYNC_HEARTBEAT_TIMEOUT", DEFAULT_HEARTBEAT_TIMEOUT)), help="seconds to wait for each heartbeat command")
     parser.add_argument("--spotify-to-ytm", action="store_true", help="only sync Spotify liked songs into YouTube Music")
     parser.add_argument("--ytm-to-spotify", action="store_true", help="only sync YouTube Music liked songs into Spotify")
     parser.add_argument("--report", default="sync-report.json", help="write JSON report here")
@@ -670,6 +1013,29 @@ def main(argv: Sequence[str] | None = None) -> int:
     auth_path = Path(args.yt_auth_file).expanduser()
     if not auth_path.is_absolute():
         auth_path = Path.cwd() / auth_path
+    yt_browser_session_dir = Path(args.yt_browser_session_dir).expanduser()
+    if not yt_browser_session_dir.is_absolute():
+        yt_browser_session_dir = Path.cwd() / yt_browser_session_dir
+
+    if should_prepare_yt_browser_session(args.yt_auth, auth_path, args.yt_refresh_browser_auth):
+        try:
+            ensure_yt_browser_auth_from_session(
+                auth_path,
+                session_dir=yt_browser_session_dir,
+                headless=args.yt_browser_headless,
+                login_timeout_seconds=args.yt_browser_login_timeout,
+            )
+        except RuntimeError as exc:
+            print(str(exc), file=sys.stderr)
+            return 2
+
+    ytm_backend_auth_mode = "browser" if args.yt_auth == "browser-session" else args.yt_auth
+
+    heartbeat = CommandHeartbeat(
+        args.heartbeat_command,
+        interval_seconds=args.heartbeat_interval,
+        timeout_seconds=args.heartbeat_timeout,
+    )
 
     spotify = SpotifyBackend(
         auth_mode=args.spotify_auth,
@@ -678,13 +1044,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         redirect_uri=args.spotify_redirect_uri,
         cache_path=args.spotify_cache,
         market=args.market,
+        heartbeat=heartbeat,
     )
     cache_path = Path(args.cache_db).expanduser()
     if not cache_path.is_absolute():
         cache_path = Path.cwd() / cache_path
     cache = SyncCache(cache_path)
     try:
-        ytm = YTMusicBackend(auth_path, args.yt_client_id, args.yt_client_secret, auth_mode=args.yt_auth)
+        ytm = YTMusicBackend(auth_path, args.yt_client_id, args.yt_client_secret, auth_mode=ytm_backend_auth_mode, heartbeat=heartbeat)
     except FileNotFoundError as exc:
         print(str(exc), file=sys.stderr)
         print(
@@ -723,10 +1090,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         "batch_delay": args.batch_delay,
         "max_add": args.max_add,
         "yt_auth": ytm.mode,
+        "yt_auth_requested": args.yt_auth,
+        "yt_browser_session_dir": str(yt_browser_session_dir),
         "cache_db": str(cache_path),
         "cache_read": bool(args.cache_read),
         "cache_write": bool(args.cache_write),
         "cache_library_ttl": args.cache_library_ttl,
+        "heartbeat_enabled": heartbeat.enabled,
+        "heartbeat_interval": args.heartbeat_interval,
+        "heartbeat_timeout": args.heartbeat_timeout,
     }
 
     if do_spotify_to_ytm:
@@ -742,16 +1114,21 @@ def main(argv: Sequence[str] | None = None) -> int:
             cache_direction="spotify_to_ytm",
             cache_read=args.cache_read,
             cache_write=args.cache_write,
+            heartbeat=heartbeat,
         )
         if args.apply:
             to_like = [match for _, match in matched]
             if args.cache_read:
                 to_like = [track for track in to_like if not cache.is_liked("ytm", track.source_id)]
-            ytm.like_tracks(
-                to_like,
-                batch_size=args.batch_size,
-                batch_delay=args.batch_delay,
-            )
+            try:
+                ytm.like_tracks(
+                    to_like,
+                    batch_size=args.batch_size,
+                    batch_delay=args.batch_delay,
+                )
+            except RuntimeError as exc:
+                print(str(exc), file=sys.stderr)
+                return 2
             if args.cache_write:
                 cache.mark_liked_many("ytm", [track.source_id for track in to_like])
         report["spotify_to_ytm"] = {
@@ -775,6 +1152,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             cache_direction="ytm_to_spotify",
             cache_read=args.cache_read,
             cache_write=args.cache_write,
+            heartbeat=heartbeat,
         )
         if args.apply:
             to_save = [match for _, match in matched]
@@ -809,10 +1187,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         "batch_delay": args.batch_delay,
         "max_add": args.max_add,
         "yt_auth": ytm.mode,
+        "yt_auth_requested": args.yt_auth,
+        "yt_browser_session_dir": str(yt_browser_session_dir),
         "cache_db": str(cache_path),
         "cache_read": bool(args.cache_read),
         "cache_write": bool(args.cache_write),
         "cache_library_ttl": args.cache_library_ttl,
+        "heartbeat_enabled": heartbeat.enabled,
+        "heartbeat_interval": args.heartbeat_interval,
+        "heartbeat_timeout": args.heartbeat_timeout,
         "spotify_to_ytm": report["spotify_to_ytm"],
         "ytm_to_spotify": report["ytm_to_spotify"],
     }, ensure_ascii=False, indent=2))
