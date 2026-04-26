@@ -47,6 +47,19 @@ export SPOTIFY_REDIRECT_URI='http://127.0.0.1:8888/callback'
 The first run opens Spotify login and stores a local token in `.cache-spotify`.
 Required scopes: `user-library-read user-library-modify`.
 
+For local/default runs, you can put non-secret defaults in `auth/spotify.json` (gitignored):
+
+```json
+{
+  "auth": "pkce",
+  "client_id": "<spotify-client-id>",
+  "redirect_uri": "http://127.0.0.1:43827/spotify/callback",
+  "cache": ".cache-spotify-pkce"
+}
+```
+
+Environment variables and CLI flags override this file.
+
 You can also pass credentials explicitly:
 
 ```bash
@@ -99,6 +112,10 @@ Then run with:
 ```bash
 uv run python src/music_liked_sync.py --yt-auth browser --yt-auth-file auth/browser.json
 ```
+
+When neither `YTMUSIC_AUTH_FILE` nor `YTMUSIC_OAUTH` is set, the default auth file is `auth/browser.json` if it exists, otherwise `auth/oauth.json`.
+
+If a browser-auth run says the account is signed out or auth appears expired, regenerate `auth/browser.json` with fresh headers from a logged-in `music.youtube.com` session.
 
 `auth/` is gitignored because it contains tokens/cookies.
 

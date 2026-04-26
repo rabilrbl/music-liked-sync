@@ -31,6 +31,7 @@ DEFAULT_BATCH_SIZE = 50
 DEFAULT_BATCH_DELAY = 1.0
 DEFAULT_CACHE_DB = "state/sync-cache.sqlite3"
 DEFAULT_LIBRARY_CACHE_TTL = 0.0
+DEFAULT_SPOTIFY_CONFIG = "auth/spotify.json"
 YTM_RETRY_ATTEMPTS = 4
 YTM_RETRY_BASE_DELAY = 2.0
 
@@ -187,6 +188,45 @@ def sleep_between_batches(
         sleep_fn(batch_delay)
 
 
+def _read_json_object(path: Path) -> dict:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def default_yt_auth_file() -> str:
+    explicit = os.environ.get("YTMUSIC_AUTH_FILE") or os.environ.get("YTMUSIC_OAUTH")
+    if explicit:
+        return explicit
+    browser_path = Path("auth/browser.json")
+    if browser_path.exists():
+        return str(browser_path)
+    return "auth/oauth.json"
+
+
+def load_spotify_config(path: Path | str | None = None) -> dict[str, str]:
+    config_path = Path(path or os.environ.get("MUSIC_SYNC_SPOTIFY_CONFIG", DEFAULT_SPOTIFY_CONFIG)).expanduser()
+    if not config_path.is_absolute():
+        config_path = Path.cwd() / config_path
+    data = _read_json_object(config_path)
+    allowed = {"auth", "client_id", "client_secret", "redirect_uri", "cache"}
+    return {key: str(value) for key, value in data.items() if key in allowed and value}
+
+
+def is_ytm_signed_out_error(exc: BaseException) -> bool:
+    message = str(exc).lower()
+    return "sign in" in message and ("liked" in message or "tracks" in message)
+
+
+def ytm_auth_expired_message() -> str:
+    return (
+        "YouTube Music auth appears expired or signed out. "
+        "Regenerate auth/browser.json with: uv run ytmusicapi browser --file auth/browser.json"
+    )
+
+
 def retry_ytm_call(
     fn,
     *,
@@ -199,6 +239,10 @@ def retry_ytm_call(
     for attempt in range(1, attempts + 1):
         try:
             return fn()
+        except KeyError as exc:
+            if is_ytm_signed_out_error(exc):
+                raise RuntimeError(ytm_auth_expired_message()) from exc
+            raise
         except json.JSONDecodeError as exc:
             last_exc = exc
             if attempt >= attempts:
@@ -595,16 +639,17 @@ def resolve_matches(
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
+    spotify_config = load_spotify_config()
     parser = argparse.ArgumentParser(description="Sync Spotify and YouTube Music liked songs")
     parser.add_argument("--yt-auth", choices=("auto", "oauth", "browser"), default=os.environ.get("YTMUSIC_AUTH", "auto"), help="YouTube Music auth type; auto detects oauth.json vs browser headers JSON")
-    parser.add_argument("--yt-auth-file", "--oauth", dest="yt_auth_file", default=os.environ.get("YTMUSIC_AUTH_FILE") or os.environ.get("YTMUSIC_OAUTH", "auth/oauth.json"), help="YouTube Music auth JSON path; --oauth is kept as a backwards-compatible alias")
+    parser.add_argument("--yt-auth-file", "--oauth", dest="yt_auth_file", default=default_yt_auth_file(), help="YouTube Music auth JSON path; --oauth is kept as a backwards-compatible alias")
     parser.add_argument("--yt-client-id", default=os.environ.get("YTMUSIC_CLIENT_ID"))
     parser.add_argument("--yt-client-secret", default=os.environ.get("YTMUSIC_CLIENT_SECRET"))
-    parser.add_argument("--spotify-auth", choices=("auto", "oauth", "pkce"), default=os.environ.get("SPOTIFY_AUTH", "auto"), help="Spotify auth backend: oauth uses client secret, pkce uses client ID only")
-    parser.add_argument("--spotify-client-id", default=os.environ.get("SPOTIFY_CLIENT_ID") or os.environ.get("SPOTIPY_CLIENT_ID"))
-    parser.add_argument("--spotify-client-secret", default=os.environ.get("SPOTIFY_CLIENT_SECRET") or os.environ.get("SPOTIPY_CLIENT_SECRET"))
-    parser.add_argument("--spotify-redirect-uri", default=os.environ.get("SPOTIFY_REDIRECT_URI") or os.environ.get("SPOTIPY_REDIRECT_URI") or "http://127.0.0.1:8888/callback")
-    parser.add_argument("--spotify-cache", default=os.environ.get("SPOTIFY_TOKEN_CACHE", ".cache-spotify"), help="Spotipy OAuth token cache path")
+    parser.add_argument("--spotify-auth", choices=("auto", "oauth", "pkce"), default=os.environ.get("SPOTIFY_AUTH") or spotify_config.get("auth", "auto"), help="Spotify auth backend: oauth uses client secret, pkce uses client ID only")
+    parser.add_argument("--spotify-client-id", default=os.environ.get("SPOTIFY_CLIENT_ID") or os.environ.get("SPOTIPY_CLIENT_ID") or spotify_config.get("client_id"))
+    parser.add_argument("--spotify-client-secret", default=os.environ.get("SPOTIFY_CLIENT_SECRET") or os.environ.get("SPOTIPY_CLIENT_SECRET") or spotify_config.get("client_secret"))
+    parser.add_argument("--spotify-redirect-uri", default=os.environ.get("SPOTIFY_REDIRECT_URI") or os.environ.get("SPOTIPY_REDIRECT_URI") or spotify_config.get("redirect_uri") or "http://127.0.0.1:8888/callback")
+    parser.add_argument("--spotify-cache", default=os.environ.get("SPOTIFY_TOKEN_CACHE") or spotify_config.get("cache", ".cache-spotify"), help="Spotipy OAuth token cache path")
     parser.add_argument("--market", default=os.environ.get("MUSIC_SYNC_MARKET", DEFAULT_MARKET), help="Spotify market code used for search/library reads")
     parser.add_argument("--apply", action="store_true", help="actually save/like matched tracks; default is dry-run")
     parser.add_argument("--max-add", type=positive_int, default=None, help="optional cap on tracks to add per direction; default processes all missing tracks")
@@ -658,7 +703,11 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     ytm_liked = cache.get_library("ytm", args.cache_library_ttl) if args.cache_read else None
     if ytm_liked is None:
-        ytm_liked = ytm.liked_tracks()
+        try:
+            ytm_liked = ytm.liked_tracks()
+        except RuntimeError as exc:
+            print(str(exc), file=sys.stderr)
+            return 2
         if args.cache_write:
             cache.store_library("ytm", ytm_liked)
     do_spotify_to_ytm = args.spotify_to_ytm or not args.ytm_to_spotify

@@ -1,3 +1,4 @@
+import music_liked_sync
 from music_liked_sync import (
     Track,
     SpotifyBackend,
@@ -5,6 +6,8 @@ from music_liked_sync import (
     YTMusicBackend,
     best_match,
     build_arg_parser,
+    default_yt_auth_file,
+    load_spotify_config,
     normalize_key,
     parse_ytm_track,
     resolve_matches,
@@ -83,13 +86,49 @@ def test_spotify_auto_auth_prefers_pkce_when_client_id_has_no_secret():
     assert SpotifyBackend._resolve_auth_mode("auto", "cid", None) == "pkce"
 
 
-def test_parser_defaults_to_all_missing_with_configurable_batches():
+def test_parser_defaults_to_all_missing_with_configurable_batches(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
     args = build_arg_parser().parse_args([])
     assert args.max_add is None
     assert args.batch_size == 50
     assert args.batch_delay == 1.0
     assert args.yt_auth == "auto"
     assert args.yt_auth_file == "auth/oauth.json"
+
+
+def test_default_yt_auth_file_prefers_browser_headers_when_available(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    auth_dir = tmp_path / "auth"
+    auth_dir.mkdir()
+    (auth_dir / "oauth.json").write_text('{"refresh_token": "x"}')
+    (auth_dir / "browser.json").write_text('{"cookie": "x", "authorization": "x"}')
+
+    assert default_yt_auth_file() == "auth/browser.json"
+
+
+def test_parser_uses_local_spotify_config_defaults(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    auth_dir = tmp_path / "auth"
+    auth_dir.mkdir()
+    (auth_dir / "spotify.json").write_text(
+        '{"auth": "pkce", "client_id": "cid", "redirect_uri": "http://127.0.0.1:43827/spotify/callback", "cache": ".cache-spotify-pkce"}'
+    )
+
+    args = build_arg_parser().parse_args([])
+
+    assert args.spotify_auth == "pkce"
+    assert args.spotify_client_id == "cid"
+    assert args.spotify_redirect_uri == "http://127.0.0.1:43827/spotify/callback"
+    assert args.spotify_cache == ".cache-spotify-pkce"
+
+
+def test_load_spotify_config_ignores_invalid_or_missing_files(tmp_path):
+    missing = load_spotify_config(tmp_path / "missing.json")
+    assert missing == {}
+
+    invalid = tmp_path / "spotify.json"
+    invalid.write_text("not json")
+    assert load_spotify_config(invalid) == {}
 
 
 def test_parser_accepts_browser_youtube_music_auth_file():
@@ -149,6 +188,54 @@ def test_youtube_likes_are_batched_with_configurable_delay():
 
     assert backend.client.calls == [(f"yt{i}", "LIKE") for i in range(5)]
     assert sleeps == [0.25, 0.25]
+
+
+def test_youtube_sign_in_response_reports_expired_browser_auth():
+    class SignedOutYTMusicClient:
+        def get_liked_songs(self, limit):
+            raise KeyError("Sign in to listen to your liked tracks")
+
+    backend = YTMusicBackend.__new__(YTMusicBackend)
+    backend.client = SignedOutYTMusicClient()
+
+    try:
+        backend.liked_tracks()
+    except RuntimeError as exc:
+        message = str(exc)
+    else:
+        raise AssertionError("expected expired auth error")
+
+    assert "YouTube Music auth appears expired" in message
+    assert "ytmusicapi browser" in message
+
+
+def test_main_returns_2_for_expired_youtube_auth(monkeypatch, tmp_path, capsys):
+    monkeypatch.chdir(tmp_path)
+
+    class FakeSpotifyBackend:
+        def __init__(self, **kwargs):
+            pass
+
+        def liked_tracks(self):
+            return []
+
+    class FakeYTMusicBackend:
+        mode = "browser"
+
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def liked_tracks(self):
+            raise RuntimeError("YouTube Music auth appears expired or signed out")
+
+    monkeypatch.setattr(music_liked_sync, "SpotifyBackend", FakeSpotifyBackend)
+    monkeypatch.setattr(music_liked_sync, "YTMusicBackend", FakeYTMusicBackend)
+
+    status = music_liked_sync.main([])
+
+    captured = capsys.readouterr()
+    assert status == 2
+    assert "YouTube Music auth appears expired" in captured.err
 
 
 def test_sync_cache_roundtrip_store_lookup_and_mark_liked(tmp_path):
