@@ -13,7 +13,6 @@ from .utils import (
     normalize_artist,
     normalize_key,
     sleep_between_batches,
-    unique_by_key,
 )
 
 
