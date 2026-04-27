@@ -6,6 +6,8 @@ Default mode is a safe dry-run. Use --apply to actually like/save matches.
 from __future__ import annotations
 
 import argparse
+import contextlib
+import fcntl
 import json
 import os
 import re
@@ -36,8 +38,8 @@ DEFAULT_BATCH_SIZE = 50
 DEFAULT_BATCH_DELAY = 1.0
 DEFAULT_CACHE_DB = "state/sync-cache.sqlite3"
 DEFAULT_LIBRARY_CACHE_TTL = 0.0
-DEFAULT_SPOTIFY_CONFIG = "auth/spotify.json"
 DEFAULT_SPOTIFY_WEB_SESSION_DIR = "auth/spotify-web-session"
+DEFAULT_SPOTIFY_WEB_LOCK_FILE = "state/locks/spotify-web-session.lock"
 DEFAULT_SPOTIFY_WEB_LOGIN_TIMEOUT = 300.0
 SPOTIFY_WEB_ORIGIN = "https://open.spotify.com"
 SPOTIFY_WEB_TOKEN_URL_PREFIX = f"{SPOTIFY_WEB_ORIGIN}/api/token"
@@ -46,8 +48,8 @@ SPOTIFY_WEB_REQUIRED_COOKIE = "sp_dc"
 SPOTIFY_API_BASE = "https://api.spotify.com/v1"
 DEFAULT_BROWSER_USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36"
 
-DEFAULT_YT_BROWSER_AUTH_FILE = "auth/browser.json"
 DEFAULT_YT_BROWSER_SESSION_DIR = "auth/ytmusic-browser-session"
+DEFAULT_YT_BROWSER_LOCK_FILE = "state/locks/ytmusic-browser-session.lock"
 YTMUSIC_ORIGIN = "https://music.youtube.com"
 YTMUSIC_REQUIRED_COOKIE = "__Secure-3PAPISID"
 DEFAULT_YT_BROWSER_LOGIN_TIMEOUT = 300.0
@@ -321,24 +323,21 @@ def _read_json_object(path: Path) -> dict:
     return data if isinstance(data, dict) else {}
 
 
-def default_yt_auth_file() -> str:
-    explicit = os.environ.get("YTMUSIC_AUTH_FILE")
-    if explicit:
-        return explicit
-    return DEFAULT_YT_BROWSER_AUTH_FILE
-
-
-def load_spotify_config(path: Path | str | None = None) -> dict[str, str]:
-    config_path = Path(path or os.environ.get("MUSIC_SYNC_SPOTIFY_CONFIG", DEFAULT_SPOTIFY_CONFIG)).expanduser()
-    if not config_path.is_absolute():
-        config_path = Path.cwd() / config_path
-    data = _read_json_object(config_path)
-    allowed = {
-        "web_session_dir",
-        "web_headless",
-        "web_login_timeout",
-    }
-    return {key: str(value) for key, value in data.items() if key in allowed and value}
+@contextlib.contextmanager
+def browser_session_lock(lock_path: Path):
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_file = lock_path.open("a+")
+    try:
+        try:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise RuntimeError(f"Browser session is already active (lock held): {lock_path}") from exc
+        yield
+    finally:
+        try:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+        finally:
+            lock_file.close()
 
 
 def _cookie_value(cookie_header: str, name: str) -> str | None:
@@ -390,7 +389,7 @@ def build_yt_browser_auth_headers(
 
 def _playwright_cookie_header(cookies: Sequence[dict]) -> str:
     # context.cookies([music.youtube.com]) already returns only cookies applicable to that URL.
-    # Sort for deterministic auth/browser.json diffs and tests.
+    # Sort for deterministic browser-cookie headers and tests.
     pairs = []
     for cookie in sorted(cookies, key=lambda item: (str(item.get("name", "")), str(item.get("domain", "")))):
         name = str(cookie.get("name", "")).strip()
@@ -463,17 +462,13 @@ def wait_for_spotify_web_access_token(page, *, timeout_ms: int = 60_000) -> str:
 
 
 def ensure_yt_browser_auth_from_session(
-    auth_path: Path,
     *,
     session_dir: Path,
     headless: bool = False,
     login_timeout_seconds: float = DEFAULT_YT_BROWSER_LOGIN_TIMEOUT,
-) -> None:
-    """Create/refresh ytmusicapi browser auth from a persistent real browser session.
-
-    First run opens a Chromium window using session_dir as the user-data dir. The user logs in once.
-    Later runs reuse that browser profile and refresh auth/browser.json from live cookies without pasted headers.
-    """
+    lock_path: Path | str = DEFAULT_YT_BROWSER_LOCK_FILE,
+) -> dict[str, str]:
+    """Return ytmusicapi browser auth headers from a persistent real browser session."""
     try:
         from playwright.sync_api import Error as PlaywrightError
         from playwright.sync_api import sync_playwright
@@ -482,39 +477,45 @@ def ensure_yt_browser_auth_from_session(
             "YouTube browser-session auth requires Playwright. Run: uv sync && uv run playwright install chromium"
         ) from exc
 
-    auth_path.parent.mkdir(parents=True, exist_ok=True)
     session_dir.mkdir(parents=True, exist_ok=True)
+    lock_path = Path(lock_path).expanduser()
+    if not lock_path.is_absolute():
+        lock_path = Path.cwd() / lock_path
     deadline = time.time() + login_timeout_seconds
 
     try:
-        with sync_playwright() as p:
-            context = p.chromium.launch_persistent_context(
-                str(session_dir),
-                headless=headless,
-                args=["--disable-blink-features=AutomationControlled"],
-            )
-            try:
-                page = context.pages[0] if context.pages else context.new_page()
-                user_agent = _safe_page_user_agent(page)
-                cookie_header = _playwright_cookie_header(context.cookies([YTMUSIC_ORIGIN]))
+        with browser_session_lock(lock_path):
+            with sync_playwright() as p:
+                context = p.chromium.launch_persistent_context(
+                    str(session_dir),
+                    headless=headless,
+                    args=["--disable-blink-features=AutomationControlled"],
+                )
+                try:
+                    page = context.pages[0] if context.pages else context.new_page()
+                    user_agent = _safe_page_user_agent(page)
+                    cookie_header = _playwright_cookie_header(context.cookies([YTMUSIC_ORIGIN]))
 
-                if not _cookie_value(cookie_header, YTMUSIC_REQUIRED_COOKIE):
-                    page.goto(YTMUSIC_ORIGIN, wait_until="domcontentloaded", timeout=60_000)
+                    if not _cookie_value(cookie_header, YTMUSIC_REQUIRED_COOKIE):
+                        page.goto(YTMUSIC_ORIGIN, wait_until="domcontentloaded", timeout=60_000)
+                        print(
+                            "YouTube Music login required. Complete login in the opened browser window; "
+                            "this browser profile will be reused on future runs.",
+                            file=sys.stderr,
+                        )
+                    while not _cookie_value(cookie_header, YTMUSIC_REQUIRED_COOKIE) and time.time() < deadline:
+                        page.wait_for_timeout(2_000)
+                        cookie_header = _playwright_cookie_header(context.cookies([YTMUSIC_ORIGIN]))
+                        user_agent = _safe_page_user_agent(page)
+
+                    headers = build_yt_browser_auth_headers(cookie_header, user_agent=user_agent)
                     print(
-                        "YouTube Music login required. Complete login in the opened browser window; "
-                        "this browser profile will be reused on future runs.",
+                        f"YouTube Music browser session auth refreshed from persistent session: {session_dir}",
                         file=sys.stderr,
                     )
-                while not _cookie_value(cookie_header, YTMUSIC_REQUIRED_COOKIE) and time.time() < deadline:
-                    page.wait_for_timeout(2_000)
-                    cookie_header = _playwright_cookie_header(context.cookies([YTMUSIC_ORIGIN]))
-                    user_agent = _safe_page_user_agent(page)
-
-                headers = build_yt_browser_auth_headers(cookie_header, user_agent=user_agent)
-                auth_path.write_text(json.dumps(headers, ensure_ascii=True, indent=4, sort_keys=True) + "\n", encoding="utf-8")
-                print(f"YouTube Music browser auth refreshed from persistent session: {auth_path}", file=sys.stderr)
-            finally:
-                context.close()
+                    return headers
+                finally:
+                    context.close()
     except PlaywrightError as exc:  # pragma: no cover - depends on local browser installation/display
         raise RuntimeError(
             "Could not open the persistent YouTube Music browser session. "
@@ -527,6 +528,7 @@ def ensure_spotify_web_session_state_from_session(
     *,
     headless: bool = False,
     login_timeout_seconds: float = DEFAULT_SPOTIFY_WEB_LOGIN_TIMEOUT,
+    lock_path: Path | str = DEFAULT_SPOTIFY_WEB_LOCK_FILE,
 ) -> SpotifyWebSessionState:
     """Return Spotify Web Player auth state from a persistent browser profile.
 
@@ -542,51 +544,55 @@ def ensure_spotify_web_session_state_from_session(
         ) from exc
 
     session_dir.mkdir(parents=True, exist_ok=True)
+    lock_path = Path(lock_path).expanduser()
+    if not lock_path.is_absolute():
+        lock_path = Path.cwd() / lock_path
     deadline = time.time() + login_timeout_seconds
 
     try:
-        with sync_playwright() as p:
-            context = p.chromium.launch_persistent_context(
-                str(session_dir),
-                headless=headless,
-                args=["--disable-blink-features=AutomationControlled"],
-            )
-            try:
-                page = context.pages[0] if context.pages else context.new_page()
-                user_agent = _safe_page_user_agent(page)
-                cookie_header = _playwright_cookie_header(context.cookies([SPOTIFY_WEB_ORIGIN]))
-
-                if not _cookie_value(cookie_header, SPOTIFY_WEB_REQUIRED_COOKIE):
-                    page.goto(SPOTIFY_WEB_ORIGIN, wait_until="domcontentloaded", timeout=60_000)
+        with browser_session_lock(lock_path):
+            with sync_playwright() as p:
+                context = p.chromium.launch_persistent_context(
+                    str(session_dir),
+                    headless=headless,
+                    args=["--disable-blink-features=AutomationControlled"],
+                )
+                try:
+                    page = context.pages[0] if context.pages else context.new_page()
                     user_agent = _safe_page_user_agent(page)
-                    print(
-                        "Spotify Web Player login required. Complete login in the opened browser window; "
-                        "this browser profile will be reused on future runs.",
-                        file=sys.stderr,
-                    )
-                while not _cookie_value(cookie_header, SPOTIFY_WEB_REQUIRED_COOKIE) and time.time() < deadline:
-                    page.wait_for_timeout(2_000)
                     cookie_header = _playwright_cookie_header(context.cookies([SPOTIFY_WEB_ORIGIN]))
-                    user_agent = _safe_page_user_agent(page)
 
-                if not _cookie_value(cookie_header, SPOTIFY_WEB_REQUIRED_COOKIE):
-                    raise RuntimeError(
-                        f"Spotify Web Player session is not logged in; missing {SPOTIFY_WEB_REQUIRED_COOKIE}. "
-                        "Complete Spotify login in the opened browser window, then rerun."
-                    )
+                    if not _cookie_value(cookie_header, SPOTIFY_WEB_REQUIRED_COOKIE):
+                        page.goto(SPOTIFY_WEB_ORIGIN, wait_until="domcontentloaded", timeout=60_000)
+                        user_agent = _safe_page_user_agent(page)
+                        print(
+                            "Spotify Web Player login required. Complete login in the opened browser window; "
+                            "this browser profile will be reused on future runs.",
+                            file=sys.stderr,
+                        )
+                    while not _cookie_value(cookie_header, SPOTIFY_WEB_REQUIRED_COOKIE) and time.time() < deadline:
+                        page.wait_for_timeout(2_000)
+                        cookie_header = _playwright_cookie_header(context.cookies([SPOTIFY_WEB_ORIGIN]))
+                        user_agent = _safe_page_user_agent(page)
 
-                state = wait_for_spotify_web_session_state(page)
-                if not state.user_agent:
-                    state = SpotifyWebSessionState(
-                        access_token=state.access_token,
-                        user_agent=user_agent,
-                        client_token=state.client_token,
-                        app_version=state.app_version,
-                    )
-                print(f"Spotify Web Player token refreshed from persistent session: {session_dir}", file=sys.stderr)
-                return state
-            finally:
-                context.close()
+                    if not _cookie_value(cookie_header, SPOTIFY_WEB_REQUIRED_COOKIE):
+                        raise RuntimeError(
+                            f"Spotify Web Player session is not logged in; missing {SPOTIFY_WEB_REQUIRED_COOKIE}. "
+                            "Complete Spotify login in the opened browser window, then rerun."
+                        )
+
+                    state = wait_for_spotify_web_session_state(page)
+                    if not state.user_agent:
+                        state = SpotifyWebSessionState(
+                            access_token=state.access_token,
+                            user_agent=user_agent,
+                            client_token=state.client_token,
+                            app_version=state.app_version,
+                        )
+                    print(f"Spotify Web Player token refreshed from persistent session: {session_dir}", file=sys.stderr)
+                    return state
+                finally:
+                    context.close()
     except PlaywrightError as exc:  # pragma: no cover - depends on local browser installation/display
         raise RuntimeError(
             "Could not open the persistent Spotify Web Player browser session. "
@@ -599,11 +605,13 @@ def ensure_spotify_web_access_token_from_session(
     *,
     headless: bool = False,
     login_timeout_seconds: float = DEFAULT_SPOTIFY_WEB_LOGIN_TIMEOUT,
+    lock_path: Path | str = DEFAULT_SPOTIFY_WEB_LOCK_FILE,
 ) -> tuple[str, str]:
     state = ensure_spotify_web_session_state_from_session(
         session_dir,
         headless=headless,
         login_timeout_seconds=login_timeout_seconds,
+        lock_path=lock_path,
     )
     return state.access_token, state.user_agent
 
@@ -719,11 +727,6 @@ def spotify_graphql_library_item_to_api_item(item: dict) -> dict | None:
     return {"track": parsed} if parsed else None
 
 
-def should_prepare_yt_browser_session(auth_mode: str, auth_path: Path, refresh: bool) -> bool:
-    _ = auth_path
-    return bool(refresh or auth_mode == "browser-session")
-
-
 def is_ytm_auth_error(exc: BaseException) -> bool:
     message = str(exc).lower()
     signed_out = "sign in" in message and ("liked" in message or "tracks" in message or "operation" in message)
@@ -733,9 +736,8 @@ def is_ytm_auth_error(exc: BaseException) -> bool:
 
 def ytm_auth_expired_message() -> str:
     return (
-        "YouTube Music auth appears expired or signed out. Refresh it from the persistent browser session: "
-        "uv run python src/music_liked_sync.py --yt-auth browser-session --yt-refresh-browser-auth. "
-        "First run opens a real browser window; log in once and the session is reused after that."
+        "YouTube Music auth appears expired or signed out. Rerun the sync so browser-session auth "
+        "can refresh from the persistent browser session. If prompted, complete login in the opened browser window."
     )
 
 
@@ -1104,16 +1106,16 @@ class SpotifyBackend:
     def __init__(
         self,
         *,
-        auth_mode: str = "web-session",
         market: str = DEFAULT_MARKET,
         heartbeat: CommandHeartbeat | None = None,
         web_session_dir: Path | str = DEFAULT_SPOTIFY_WEB_SESSION_DIR,
         web_headless: bool = False,
         web_login_timeout_seconds: float = DEFAULT_SPOTIFY_WEB_LOGIN_TIMEOUT,
+        lock_path: Path | str = DEFAULT_SPOTIFY_WEB_LOCK_FILE,
     ) -> None:
         self.market = market
         self.heartbeat = heartbeat
-        self.mode = self._resolve_auth_mode(auth_mode)
+        self.mode = self._resolve_auth_mode()
 
         session_dir = Path(web_session_dir).expanduser()
         if not session_dir.is_absolute():
@@ -1124,14 +1126,13 @@ class SpotifyBackend:
                 session_dir,
                 headless=web_headless,
                 login_timeout_seconds=web_login_timeout_seconds,
+                lock_path=lock_path,
             )
         )
 
     @staticmethod
-    def _resolve_auth_mode(auth_mode: str) -> str:
-        if auth_mode in {"auto", "web-session"}:
-            return "web-session"
-        raise ValueError(f"unsupported Spotify auth backend: {auth_mode}")
+    def _resolve_auth_mode() -> str:
+        return "web-session"
 
     def liked_tracks(self) -> list[Track]:
         tracks: list[Track] = []
@@ -1199,31 +1200,21 @@ class SpotifyBackend:
 class YTMusicBackend:
     def __init__(
         self,
-        auth_path: Path,
-        auth_mode: str = "browser-session",
+        auth_headers: dict[str, str],
         heartbeat: CommandHeartbeat | None = None,
     ) -> None:
         from ytmusicapi import YTMusic
 
-        if not auth_path.exists():
-            raise FileNotFoundError(f"YouTube Music auth file missing: {auth_path}")
+        if not auth_headers:
+            raise ValueError("YouTube Music browser-session auth headers are missing")
 
         self.heartbeat = heartbeat
-        self.mode = self.resolve_auth_mode(auth_mode, auth_path)
-        self.client = YTMusic(str(auth_path))
+        self.mode = self.resolve_auth_mode()
+        self.client = YTMusic(auth_headers)
 
     @staticmethod
-    def resolve_auth_mode(
-        auth_mode: str,
-        auth_path: Path,
-    ) -> str:
-        if auth_mode not in {"browser", "browser-session"}:
-            raise ValueError(f"unsupported YouTube Music auth backend: {auth_mode}")
-        if auth_mode == "browser-session":
-            if auth_path.name != Path(DEFAULT_YT_BROWSER_AUTH_FILE).name:
-                raise ValueError("browser-session auth requires --yt-auth-file to point to browser headers JSON")
-            return "browser-session"
-        return "browser"
+    def resolve_auth_mode() -> str:
+        return "browser-session"
 
     def liked_tracks(self, limit: int | None = None) -> list[Track]:
         heartbeat = getattr(self, "heartbeat", None)
@@ -1266,7 +1257,6 @@ class YTMusicBackend:
                     label=f"YTM rate_song {track.source_id}",
                 )
             sleep_between_batches(index, len(chunks), batch_delay, sleep_fn)
-
 
 def compute_missing(left: Sequence[Track], right: Sequence[Track]) -> list[Track]:
     right_keys = set(unique_by_key(right))
@@ -1327,28 +1317,7 @@ def resolve_matches(
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
-    spotify_config = load_spotify_config()
     parser = argparse.ArgumentParser(description="Sync Spotify and YouTube Music liked songs")
-    parser.add_argument(
-        "--yt-auth",
-        choices=("browser", "browser-session"),
-        default="browser-session",
-        help="YouTube Music auth type; browser-session opens/reuses a persistent browser profile and writes browser headers JSON",
-    )
-    parser.add_argument("--yt-auth-file", dest="yt_auth_file", default=default_yt_auth_file(), help="YouTube Music browser auth JSON path")
-    parser.add_argument("--yt-browser-session-dir", default=os.environ.get("YTMUSIC_BROWSER_SESSION_DIR", DEFAULT_YT_BROWSER_SESSION_DIR), help="persistent browser profile used for YouTube Music login/session reuse")
-    parser.add_argument("--yt-browser-headless", action="store_true", help="run the YouTube Music browser session headless after first login is complete")
-    parser.add_argument("--yt-browser-login-timeout", type=non_negative_float, default=float(os.environ.get("YTMUSIC_BROWSER_LOGIN_TIMEOUT", DEFAULT_YT_BROWSER_LOGIN_TIMEOUT)), help="seconds to wait for first-time YouTube Music browser login")
-    parser.add_argument("--yt-refresh-browser-auth", action="store_true", help="refresh auth/browser.json from the persistent browser session before syncing")
-    parser.add_argument(
-        "--spotify-auth",
-        choices=("auto", "web-session"),
-        default="web-session",
-        help="Spotify auth backend: web-session reuses Spotify Web Player browser login",
-    )
-    parser.add_argument("--spotify-web-session-dir", default=os.environ.get("SPOTIFY_WEB_SESSION_DIR") or spotify_config.get("web_session_dir", DEFAULT_SPOTIFY_WEB_SESSION_DIR), help="persistent browser profile used for Spotify Web Player login/session reuse")
-    parser.add_argument("--spotify-web-headless", action="store_true", default=config_bool(os.environ.get("SPOTIFY_WEB_HEADLESS") or spotify_config.get("web_headless")), help="run the Spotify Web Player browser session headless after first login is complete")
-    parser.add_argument("--spotify-web-login-timeout", type=non_negative_float, default=float(os.environ.get("SPOTIFY_WEB_LOGIN_TIMEOUT") or spotify_config.get("web_login_timeout", DEFAULT_SPOTIFY_WEB_LOGIN_TIMEOUT)), help="seconds to wait for first-time Spotify Web Player login")
     parser.add_argument("--market", default=os.environ.get("MUSIC_SYNC_MARKET", DEFAULT_MARKET), help="Spotify market code used for search/library reads")
     parser.add_argument("--apply", action="store_true", help="actually save/like matched tracks; default is dry-run")
     parser.add_argument("--max-add", type=positive_int, default=None, help="optional cap on tracks to add per direction; default processes all missing tracks")
@@ -1366,43 +1335,23 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--report", default="sync-report.json", help="write JSON report here")
     return parser
 
-
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_arg_parser().parse_args(argv)
 
-    yt_auth_env = os.environ.get("YTMUSIC_AUTH")
-    if yt_auth_env:
-        if yt_auth_env not in {"browser", "browser-session"}:
-            print(f"Unsupported YTMUSIC_AUTH: {yt_auth_env}. Allowed: browser, browser-session", file=sys.stderr)
-            return 2
-        args.yt_auth = yt_auth_env
-
-    spotify_auth_env = os.environ.get("SPOTIFY_AUTH")
-    if spotify_auth_env:
-        if spotify_auth_env not in {"auto", "web-session"}:
-            print(f"Unsupported SPOTIFY_AUTH: {spotify_auth_env}. Allowed: auto, web-session", file=sys.stderr)
-            return 2
-        args.spotify_auth = spotify_auth_env
-    auth_path = Path(args.yt_auth_file).expanduser()
-    if not auth_path.is_absolute():
-        auth_path = Path.cwd() / auth_path
-    yt_browser_session_dir = Path(args.yt_browser_session_dir).expanduser()
+    yt_browser_session_dir = Path(DEFAULT_YT_BROWSER_SESSION_DIR).expanduser()
     if not yt_browser_session_dir.is_absolute():
         yt_browser_session_dir = Path.cwd() / yt_browser_session_dir
+    spotify_web_session_dir = Path(DEFAULT_SPOTIFY_WEB_SESSION_DIR).expanduser()
+    if not spotify_web_session_dir.is_absolute():
+        spotify_web_session_dir = Path.cwd() / spotify_web_session_dir
 
-    if should_prepare_yt_browser_session(args.yt_auth, auth_path, args.yt_refresh_browser_auth):
-        try:
-            ensure_yt_browser_auth_from_session(
-                auth_path,
-                session_dir=yt_browser_session_dir,
-                headless=args.yt_browser_headless,
-                login_timeout_seconds=args.yt_browser_login_timeout,
-            )
-        except RuntimeError as exc:
-            print(str(exc), file=sys.stderr)
-            return 2
-
-    ytm_backend_auth_mode = args.yt_auth
+    try:
+        yt_auth_headers = ensure_yt_browser_auth_from_session(
+            session_dir=yt_browser_session_dir,
+        )
+    except RuntimeError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
 
     heartbeat = CommandHeartbeat(
         args.heartbeat_command,
@@ -1412,12 +1361,9 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     try:
         spotify = SpotifyBackend(
-            auth_mode=args.spotify_auth,
             market=args.market,
             heartbeat=heartbeat,
-            web_session_dir=args.spotify_web_session_dir,
-            web_headless=args.spotify_web_headless,
-            web_login_timeout_seconds=args.spotify_web_login_timeout,
+            web_session_dir=spotify_web_session_dir,
         )
     except (RuntimeError, ValueError) as exc:
         print(str(exc), file=sys.stderr)
@@ -1427,13 +1373,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         cache_path = Path.cwd() / cache_path
     cache = SyncCache(cache_path)
     try:
-        ytm = YTMusicBackend(auth_path, auth_mode=ytm_backend_auth_mode, heartbeat=heartbeat)
-    except (FileNotFoundError, ValueError) as exc:
+        ytm = YTMusicBackend(yt_auth_headers, heartbeat=heartbeat)
+    except ValueError as exc:
         print(str(exc), file=sys.stderr)
-        print(
-            "Run: uv run python src/music_liked_sync.py --yt-auth browser-session",
-            file=sys.stderr,
-        )
         return 2
 
     spotify_liked = cache.get_library("spotify", args.cache_library_ttl) if args.cache_read else None
@@ -1464,11 +1406,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         "batch_delay": args.batch_delay,
         "max_add": args.max_add,
         "yt_auth": ytm.mode,
-        "yt_auth_requested": args.yt_auth,
         "yt_browser_session_dir": str(yt_browser_session_dir),
-        "spotify_auth": getattr(spotify, "mode", args.spotify_auth),
-        "spotify_auth_requested": args.spotify_auth,
-        "spotify_web_session_dir": str(Path(args.spotify_web_session_dir).expanduser()),
+        "spotify_auth": getattr(spotify, "mode", "web-session"),
+        "spotify_web_session_dir": str(spotify_web_session_dir),
         "cache_db": str(cache_path),
         "cache_read": bool(args.cache_read),
         "cache_write": bool(args.cache_write),
@@ -1564,11 +1504,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         "batch_delay": args.batch_delay,
         "max_add": args.max_add,
         "yt_auth": ytm.mode,
-        "yt_auth_requested": args.yt_auth,
         "yt_browser_session_dir": str(yt_browser_session_dir),
-        "spotify_auth": getattr(spotify, "mode", args.spotify_auth),
-        "spotify_auth_requested": args.spotify_auth,
-        "spotify_web_session_dir": str(Path(args.spotify_web_session_dir).expanduser()),
+        "spotify_auth": getattr(spotify, "mode", "web-session"),
+        "spotify_web_session_dir": str(spotify_web_session_dir),
         "cache_db": str(cache_path),
         "cache_read": bool(args.cache_read),
         "cache_write": bool(args.cache_write),
@@ -1578,7 +1516,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         "heartbeat_timeout": args.heartbeat_timeout,
     }, ensure_ascii=False, indent=2))
     return 0
-
 
 if __name__ == "__main__":
     raise SystemExit(main())

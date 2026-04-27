@@ -6,10 +6,10 @@ from music_liked_sync import (
     SyncCache,
     YTMusicBackend,
     best_match,
+    browser_session_lock,
     build_arg_parser,
     build_spotify_search_queries,
     build_yt_browser_auth_headers,
-    default_yt_auth_file,
     normalize_key,
     parse_ytm_track,
     resolve_matches,
@@ -43,30 +43,39 @@ def test_parse_ytm_track_handles_artists_list():
     assert parse_ytm_track(item) == Track(title="Need Your Love", artists=("OneRepublic",), source_id="abc")
 
 
-def test_parser_rejects_removed_spotify_auth_modes():
-    try:
-        build_arg_parser().parse_args(["--spotify-auth", "oauth"])
-    except SystemExit as exc:
-        assert exc.code == 2
-    else:
-        raise AssertionError("expected parser to reject non-session Spotify auth mode")
+def test_parser_rejects_removed_legacy_auth_flags():
+    for argv in (
+        ["--spotify-auth", "web-session"],
+        ["--spotify-auth", "oauth"],
+        ["--yt-auth", "browser-session"],
+        ["--yt-auth", "browser"],
+        ["--yt-auth-file", "auth/browser.json"],
+        ["--yt-browser-session-dir", "auth/session"],
+        ["--yt-browser-headless"],
+        ["--yt-browser-login-timeout", "12"],
+        ["--yt-refresh-browser-auth"],
+        ["--spotify-web-session-dir", "auth/spotify-web"],
+        ["--spotify-web-headless"],
+        ["--spotify-web-login-timeout", "15"],
+    ):
+        try:
+            build_arg_parser().parse_args(argv)
+        except SystemExit as exc:
+            assert exc.code == 2
+        else:
+            raise AssertionError(f"expected parser to reject removed auth flag(s): {argv}")
 
-def test_parser_accepts_spotify_web_session_settings():
-    args = build_arg_parser().parse_args(
-        [
-            "--spotify-auth",
-            "web-session",
-            "--spotify-web-session-dir",
-            "auth/spotify-web",
-            "--spotify-web-headless",
-            "--spotify-web-login-timeout",
-            "15",
-        ]
-    )
-    assert args.spotify_auth == "web-session"
-    assert args.spotify_web_session_dir == "auth/spotify-web"
-    assert args.spotify_web_headless is True
-    assert args.spotify_web_login_timeout == 15.0
+
+def test_parser_defaults_are_session_only_without_auth_cli_knobs():
+    args = build_arg_parser().parse_args([])
+    assert args.max_add is None
+    assert args.batch_size == 50
+    assert args.batch_delay == 1.0
+    assert args.market == "IN"
+
+
+def test_spotify_auth_mode_is_always_web_session():
+    assert SpotifyBackend._resolve_auth_mode() == "web-session"
 
 
 def test_spotify_web_client_retries_once_after_401(monkeypatch):
@@ -110,70 +119,13 @@ def test_spotify_web_token_from_payload_rejects_anonymous_token():
     assert music_liked_sync.spotify_web_token_from_payload({"accessToken": "user-token", "isAnonymous": False}) == "user-token"
 
 
-def test_spotify_auth_mode_is_always_web_session():
-    assert SpotifyBackend._resolve_auth_mode("web-session") == "web-session"
-    assert SpotifyBackend._resolve_auth_mode("auto") == "web-session"
-
-
-def test_parser_defaults_to_persistent_youtube_browser_session_with_configurable_batches(monkeypatch, tmp_path):
-    monkeypatch.chdir(tmp_path)
-    monkeypatch.setenv("YTMUSIC_AUTH", "browser")
-    monkeypatch.setenv("SPOTIFY_AUTH", "auto")
+def test_parser_has_no_auth_selector_attributes():
     args = build_arg_parser().parse_args([])
-    assert args.max_add is None
-    assert args.batch_size == 50
-    assert args.batch_delay == 1.0
-    assert args.yt_auth == "browser-session"
-    assert args.yt_auth_file == "auth/browser.json"
-    assert args.yt_browser_session_dir == "auth/ytmusic-browser-session"
-    assert args.spotify_auth == "web-session"
-
-
-def test_default_yt_auth_file_uses_browser_session_auth_path(monkeypatch, tmp_path):
-    monkeypatch.chdir(tmp_path)
-    auth_dir = tmp_path / "auth"
-    auth_dir.mkdir()
-    (auth_dir / "oauth.json").write_text('{"refresh_token": "***"}')
-
-    assert default_yt_auth_file() == "auth/browser.json"
-
-
-def test_parser_ignores_removed_spotify_oauth_defaults(monkeypatch, tmp_path):
-    monkeypatch.chdir(tmp_path)
-    auth_dir = tmp_path / "auth"
-    auth_dir.mkdir()
-    (auth_dir / "spotify.json").write_text('{"auth": "oauth", "client_id": "cid", "client_secret": "secret"}')
-
-    args = build_arg_parser().parse_args([])
-
-    assert args.spotify_auth == "web-session"
-
-
-def test_parser_rejects_removed_yt_oauth_mode():
-    try:
-        build_arg_parser().parse_args(["--yt-auth", "oauth"])
-    except SystemExit as exc:
-        assert exc.code == 2
-    else:
-        raise AssertionError("expected parser to reject removed yt oauth mode")
-
-
-def test_parser_accepts_persistent_youtube_music_browser_session_flags():
-    args = build_arg_parser().parse_args(
-        [
-            "--yt-auth",
-            "browser-session",
-            "--yt-browser-session-dir",
-            "auth/session",
-            "--yt-browser-login-timeout",
-            "12",
-            "--yt-refresh-browser-auth",
-        ]
-    )
-    assert args.yt_auth == "browser-session"
-    assert args.yt_browser_session_dir == "auth/session"
-    assert args.yt_browser_login_timeout == 12.0
-    assert args.yt_refresh_browser_auth is True
+    assert not hasattr(args, "yt_auth")
+    assert not hasattr(args, "yt_auth_file")
+    assert not hasattr(args, "yt_browser_session_dir")
+    assert not hasattr(args, "spotify_auth")
+    assert not hasattr(args, "spotify_web_session_dir")
 
 
 def test_build_yt_browser_auth_headers_from_session_cookie():
@@ -277,11 +229,8 @@ def test_resolve_matches_calls_heartbeat_between_items():
     assert heartbeat.calls == 2
 
 
-def test_ytmusic_backend_detects_browser_auth_file(tmp_path):
-    auth_file = tmp_path / "browser.json"
-    auth_file.write_text('{"cookie":"SID=x", "authorization":"SAPISIDHASH y", "x-goog-authuser":"0"}')
-
-    assert YTMusicBackend.resolve_auth_mode("browser", auth_file) == "browser"
+def test_ytmusic_backend_resolves_single_auth_mode():
+    assert YTMusicBackend.resolve_auth_mode() == "browser-session"
 
 
 def test_spotify_save_tracks_uses_configurable_batches():
@@ -370,7 +319,7 @@ def test_main_returns_2_when_browser_session_setup_fails(monkeypatch, tmp_path, 
 
     monkeypatch.setattr(music_liked_sync, "ensure_yt_browser_auth_from_session", fail)
 
-    status = music_liked_sync.main(["--yt-auth", "browser-session"])
+    status = music_liked_sync.main([])
 
     captured = capsys.readouterr()
     assert status == 2
@@ -379,9 +328,10 @@ def test_main_returns_2_when_browser_session_setup_fails(monkeypatch, tmp_path, 
 
 def test_main_returns_2_when_youtube_write_auth_fails(monkeypatch, tmp_path, capsys):
     monkeypatch.chdir(tmp_path)
-    monkeypatch.setattr(music_liked_sync, "should_prepare_yt_browser_session", lambda *args, **kwargs: False)
     source = Track(title="Believer", artists=("Imagine Dragons",), source_id="spotify:track:1")
     target = Track(title="Believer", artists=("Imagine Dragons",), source_id="yt1")
+
+    monkeypatch.setattr(music_liked_sync, "ensure_yt_browser_auth_from_session", lambda **kwargs: {"cookie": "SID=x", "authorization": "SAPISIDHASH x", "x-goog-authuser": "0"})
 
     class FakeSpotifyBackend:
         def __init__(self, **kwargs):
@@ -409,33 +359,21 @@ def test_main_returns_2_when_youtube_write_auth_fails(monkeypatch, tmp_path, cap
     monkeypatch.setattr(music_liked_sync, "YTMusicBackend", FakeYTMusicBackend)
     monkeypatch.setattr(music_liked_sync, "resolve_matches", lambda *args, **kwargs: ([(source, target)], []))
 
-    status = music_liked_sync.main(["--yt-auth", "browser-session", "--spotify-to-ytm", "--apply"])
+    status = music_liked_sync.main(["--spotify-to-ytm", "--apply"])
 
     captured = capsys.readouterr()
     assert status == 2
     assert "YouTube Music auth appears expired" in captured.err
 
 
-def test_main_returns_2_for_unsupported_spotify_auth_env(monkeypatch, tmp_path, capsys):
-    monkeypatch.chdir(tmp_path)
-    monkeypatch.setenv("SPOTIFY_AUTH", "oauth")
-
-    status = music_liked_sync.main([])
-
-    captured = capsys.readouterr()
-    assert status == 2
-    assert "Unsupported SPOTIFY_AUTH" in captured.err
-
-
-def test_main_returns_2_for_unsupported_yt_auth_env(monkeypatch, tmp_path, capsys):
-    monkeypatch.chdir(tmp_path)
-    monkeypatch.setenv("YTMUSIC_AUTH", "oauth")
-
-    status = music_liked_sync.main([])
-
-    captured = capsys.readouterr()
-    assert status == 2
-    assert "Unsupported YTMUSIC_AUTH" in captured.err
+def test_browser_session_lock_blocks_second_lock(tmp_path):
+    lock_path = tmp_path / "locks" / "yt.lock"
+    with browser_session_lock(lock_path):
+        try:
+            with browser_session_lock(lock_path):
+                raise AssertionError("second lock acquisition should fail")
+        except RuntimeError as exc:
+            assert "already active" in str(exc)
 
 
 def test_sync_cache_roundtrip_store_lookup_and_mark_liked(tmp_path):

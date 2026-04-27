@@ -5,8 +5,9 @@ Bidirectional sync for Spotify liked songs and YouTube Music liked songs.
 Defaults are safe and session-first:
 - Dry-run by default (`--apply` required to write)
 - Session auth only
-  - Spotify: `web-session` (with `auto` accepted and coerced to `web-session`)
-  - YouTube Music: `browser` or `browser-session`
+  - Spotify: persistent Spotify Web Player browser session
+  - YouTube Music: persistent YouTube Music browser session
+- Browser session access is guarded by lock files so only one active browser window/session refresh runs at a time
 - Conservative matching (title + artist normalization, then fuzzy fallback)
 - Writes JSON report (`sync-report.json`)
 - Persists sqlite cache (`state/sync-cache.sqlite3`) for matches/liked-state reuse
@@ -27,46 +28,25 @@ uv sync --all-groups
 uv run playwright install chromium
 ```
 
-## Auth model (session only)
+## Auth model
 
-## Spotify (`--spotify-auth web-session`)
+Auth is intentionally single-path and browser-session only. There is no static YouTube header file (`browser.json`) mode and no Spotify/YT auth-mode selector.
+
+## Spotify
 
 First run opens `https://open.spotify.com` in Chromium. Log in once.
 A persistent browser profile is stored at `auth/spotify-web-session/`.
 Future runs reuse the profile and mint short-lived web access tokens.
 
-You can set Spotify session defaults in `auth/spotify.json` (gitignored):
+The active Spotify browser session is protected by `state/locks/spotify-web-session.lock`.
 
-```json
-{
-  "web_session_dir": "auth/spotify-web-session",
-  "web_headless": false,
-  "web_login_timeout": 300
-}
-```
-
-## YouTube Music (`--yt-auth browser-session` preferred)
+## YouTube Music
 
 First run opens `https://music.youtube.com` in Chromium. Log in once.
 A persistent browser profile is stored at `auth/ytmusic-browser-session/`.
-The script generates/refreshes `auth/browser.json` from that session.
+Future runs build fresh ytmusicapi browser headers directly from that live session; nothing is written to `auth/browser.json`.
 
-```bash
-uv run python src/music_liked_sync.py --yt-auth browser-session
-```
-
-To force-refresh `auth/browser.json` from the stored browser session:
-
-```bash
-uv run python src/music_liked_sync.py --yt-auth browser-session --yt-refresh-browser-auth
-```
-
-Manual browser-header mode remains available:
-
-```bash
-uv run ytmusicapi browser --file auth/browser.json
-uv run python src/music_liked_sync.py --yt-auth browser --yt-auth-file auth/browser.json
-```
+The active YouTube Music browser session is protected by `state/locks/ytmusic-browser-session.lock`.
 
 `auth/` is gitignored because it contains sensitive session/cookie data.
 
@@ -120,18 +100,6 @@ uv run python src/music_liked_sync.py --no-cache-read --no-cache-write
 ## CLI options
 
 ```text
---yt-auth {browser,browser-session}
---yt-auth-file PATH
---yt-browser-session-dir PATH
---yt-browser-headless
---yt-browser-login-timeout FLOAT
---yt-refresh-browser-auth
-
---spotify-auth {auto,web-session}
---spotify-web-session-dir PATH
---spotify-web-headless
---spotify-web-login-timeout FLOAT
-
 --market IN
 --apply
 --max-add INT
