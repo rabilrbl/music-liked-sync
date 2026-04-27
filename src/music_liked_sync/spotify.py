@@ -7,6 +7,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from collections.abc import Callable, Sequence
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 from .constants import (
@@ -504,22 +505,42 @@ class SpotifyBackend:
             )
         )
 
-    def liked_tracks(self) -> list[Track]:
+    def liked_tracks(self, max_workers: int = 4) -> list[Track]:
+        first_page = retry_spotify_call(
+            lambda: self.client.current_user_saved_tracks(limit=50, offset=0, market=self.market),
+            label="Spotify current_user_saved_tracks (page 1)",
+        )
+        total = int(first_page.get("total") or 0)
+        items = first_page.get("items", []) or []
         tracks: list[Track] = []
-        offset = 0
-        while True:
-            page = retry_spotify_call(
-                lambda offset=offset: self.client.current_user_saved_tracks(limit=50, offset=offset, market=self.market),
-                label="Spotify current_user_saved_tracks",
-            )
-            items = page.get("items", []) or []
+
+        def parse_items(items):
+            parsed_batch = []
             for item in items:
                 parsed = parse_spotify_track(item)
                 if parsed:
-                    tracks.append(parsed)
-            offset += len(items)
-            if not items or offset >= int(page.get("total") or offset):
-                break
+                    parsed_batch.append(parsed)
+            return parsed_batch
+
+        tracks.extend(parse_items(items))
+
+        if total <= 50:
+            return tracks
+
+        offsets = list(range(50, total, 50))
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = [
+                executor.submit(
+                    retry_spotify_call,
+                    lambda offset=offset: self.client.current_user_saved_tracks(limit=50, offset=offset, market=self.market),
+                    label=f"Spotify current_user_saved_tracks (offset {offset})",
+                )
+                for offset in offsets
+            ]
+            for future in futures:
+                page = future.result()
+                tracks.extend(parse_items(page.get("items", []) or []))
+
         return tracks
 
     def search_track(self, wanted: Track, limit: int = 5) -> list[Track]:
@@ -546,6 +567,7 @@ class SpotifyBackend:
         batch_size: int = DEFAULT_BATCH_SIZE,
         batch_delay: float = DEFAULT_BATCH_DELAY,
         sleep_fn: Callable[[float], None] = time.sleep,
+        max_workers: int = 4,
     ) -> None:
         ids = [track.source_id.split(":")[-1] for track in tracks]
         effective_batch_size = min(batch_size, 50)

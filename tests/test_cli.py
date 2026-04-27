@@ -95,7 +95,7 @@ def test_main_returns_2_when_ytm_liked_tracks_fails(monkeypatch, tmp_path, capsy
         def __init__(self, **kwargs):
             pass
 
-        def liked_tracks(self):
+        def liked_tracks(self, **kwargs):
             return []
 
     class MockYTM:
@@ -125,7 +125,7 @@ def test_main_returns_2_when_ytm_like_tracks_fails(monkeypatch, tmp_path, capsys
         def __init__(self, **kwargs):
             pass
 
-        def liked_tracks(self):
+        def liked_tracks(self, **kwargs):
             return [source]
 
     class MockYTM:
@@ -134,7 +134,7 @@ def test_main_returns_2_when_ytm_like_tracks_fails(monkeypatch, tmp_path, capsys
         def __init__(self, auth):
             pass
 
-        def liked_tracks(self):
+        def liked_tracks(self, **kwargs):
             return []
 
         def search_track(self, wanted):
@@ -163,7 +163,7 @@ def test_main_success_full_sync(monkeypatch, tmp_path, capsys):
         def __init__(self, **kwargs):
             pass
 
-        def liked_tracks(self):
+        def liked_tracks(self, **kwargs):
             return [spotify_track]
 
         def search_track(self, wanted):
@@ -178,7 +178,7 @@ def test_main_success_full_sync(monkeypatch, tmp_path, capsys):
         def __init__(self, auth):
             pass
 
-        def liked_tracks(self):
+        def liked_tracks(self, **kwargs):
             return [ytm_track]
 
         def search_track(self, wanted):

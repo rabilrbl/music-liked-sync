@@ -51,6 +51,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--spotify-to-ytm", action="store_true", help="only sync Spotify liked songs into YouTube Music")
     parser.add_argument("--ytm-to-spotify", action="store_true", help="only sync YouTube Music liked songs into Spotify")
     parser.add_argument("--report", default="sync-report.json", help="write JSON report here")
+    parser.add_argument("--workers", type=positive_int, default=int(os.environ.get("MUSIC_SYNC_WORKERS", "4")), help="concurrency for searches and library fetching")
     return parser
 
 
@@ -97,7 +98,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     spotify_liked = cache.get_library("spotify", args.cache_library_ttl) if args.cache_read else None
     if spotify_liked is None:
-        spotify_liked = spotify.liked_tracks()
+        spotify_liked = spotify.liked_tracks(max_workers=args.workers)
         if args.cache_write:
             cache.store_library("spotify", spotify_liked)
 
@@ -146,6 +147,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             cache_direction="spotify_to_ytm",
             cache_read=args.cache_read,
             cache_write=args.cache_write,
+            max_workers=args.workers,
         )
         if args.apply:
             to_like = [match for _, match in matched]
@@ -156,6 +158,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     to_like,
                     batch_size=args.batch_size,
                     batch_delay=args.batch_delay,
+                    max_workers=args.workers,
                 )
             except RuntimeError as exc:
                 print(str(exc), file=sys.stderr)
@@ -183,6 +186,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             cache_direction="ytm_to_spotify",
             cache_read=args.cache_read,
             cache_write=args.cache_write,
+            max_workers=args.workers,
         )
         if args.apply:
             to_save = [match for _, match in matched]
@@ -192,6 +196,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 to_save,
                 batch_size=args.batch_size,
                 batch_delay=args.batch_delay,
+                max_workers=args.workers,
             )
             if args.cache_write:
                 cache.mark_liked_many("spotify", [track.source_id for track in to_save])

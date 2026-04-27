@@ -2,6 +2,7 @@ import json
 import sys
 import time
 from collections.abc import Callable, Sequence
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from hashlib import sha1
 from pathlib import Path
 
@@ -249,12 +250,19 @@ class YTMusicBackend:
         batch_size: int = DEFAULT_BATCH_SIZE,
         batch_delay: float = DEFAULT_BATCH_DELAY,
         sleep_fn: Callable[[float], None] = time.sleep,
+        max_workers: int = 4,
     ) -> None:
         chunks = batched(tracks, batch_size)
-        for index, chunk in enumerate(chunks):
-            for track in chunk:
-                retry_ytm_call(
-                    lambda track_id=track.source_id: self.client.rate_song(track_id, "LIKE"),
-                    label=f"YTM rate_song {track.source_id}",
-                )
-            sleep_between_batches(index, len(chunks), batch_delay, sleep_fn)
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            for index, chunk in enumerate(chunks):
+                futures = [
+                    executor.submit(
+                        retry_ytm_call,
+                        lambda track_id=track.source_id: self.client.rate_song(track_id, "LIKE"),
+                        label=f"YTM rate_song {track.source_id}",
+                    )
+                    for track in chunk
+                ]
+                for future in futures:
+                    future.result()
+                sleep_between_batches(index, len(chunks), batch_delay, sleep_fn)
