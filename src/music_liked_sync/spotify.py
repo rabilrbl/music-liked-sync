@@ -7,6 +7,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from collections.abc import Callable, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from .constants import (
@@ -291,13 +292,23 @@ def parse_spotify_track(item: dict) -> Track | None:
 def build_spotify_search_queries(wanted: Track) -> list[str]:
     seen: set[str] = set()
     queries: list[str] = []
+    from .utils import normalize_text, normalize_artist
+    
     title = wanted.title.strip()
+    norm_title = normalize_text(title, wanted.artists)
     primary_artist = primary_search_artist(wanted.artists)
+    all_artists = " ".join(normalize_artist(a) for a in wanted.artists if a)
+
     candidates = [
         f"track:{title} artist:{primary_artist}" if title and primary_artist else "",
+        f"track:{norm_title} artist:{primary_artist}" if norm_title and primary_artist else "",
         f"track:{title}" if title else "",
+        f"track:{norm_title}" if norm_title else "",
         f"{title} {primary_artist}".strip(),
+        f"{norm_title} {primary_artist}".strip(),
+        f"{norm_title} {all_artists}".strip(),
         title,
+        norm_title,
     ]
     for candidate in candidates:
         query = truncate_query(candidate)
@@ -504,25 +515,54 @@ class SpotifyBackend:
             )
         )
 
-    def liked_tracks(self) -> list[Track]:
+    def liked_tracks(self, max_workers: int = 4, verbose: bool = False) -> list[Track]:
+        if verbose:
+            print("Fetching Spotify liked tracks library...")
+        first_page = retry_spotify_call(
+            lambda: self.client.current_user_saved_tracks(limit=50, offset=0, market=self.market),
+            label="Spotify current_user_saved_tracks (page 1)",
+        )
+        total = int(first_page.get("total") or 0)
+        if verbose:
+            print(f"  Found {total} tracks in Spotify library")
+        items = first_page.get("items", []) or []
         tracks: list[Track] = []
-        offset = 0
-        while True:
-            page = retry_spotify_call(
-                lambda offset=offset: self.client.current_user_saved_tracks(limit=50, offset=offset, market=self.market),
-                label="Spotify current_user_saved_tracks",
-            )
-            items = page.get("items", []) or []
+
+        def parse_items(items):
+            parsed_batch = []
             for item in items:
                 parsed = parse_spotify_track(item)
                 if parsed:
-                    tracks.append(parsed)
-            offset += len(items)
-            if not items or offset >= int(page.get("total") or offset):
-                break
+                    parsed_batch.append(parsed)
+            return parsed_batch
+
+        tracks.extend(parse_items(items))
+
+        if total <= 50:
+            return tracks
+
+        offsets = list(range(50, total, 50))
+        if verbose:
+            print(f"  Parallel fetching {len(offsets)} more pages...")
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = [
+                executor.submit(
+                    retry_spotify_call,
+                    lambda offset=offset: self.client.current_user_saved_tracks(limit=50, offset=offset, market=self.market),
+                    label=f"Spotify current_user_saved_tracks (offset {offset})",
+                )
+                for offset in offsets
+            ]
+            for future in futures:
+                page = future.result()
+                tracks.extend(parse_items(page.get("items", []) or []))
+
+        if verbose:
+            print(f"  Finished fetching {len(tracks)} tracks from Spotify")
         return tracks
 
     def search_track(self, wanted: Track, limit: int = 5) -> list[Track]:
+        # Note: verbose logging for search is handled in resolve_matches
         for query in build_spotify_search_queries(wanted):
             try:
                 page = retry_spotify_call(
@@ -546,11 +586,17 @@ class SpotifyBackend:
         batch_size: int = DEFAULT_BATCH_SIZE,
         batch_delay: float = DEFAULT_BATCH_DELAY,
         sleep_fn: Callable[[float], None] = time.sleep,
+        max_workers: int = 4,
+        verbose: bool = False,
     ) -> None:
+        if verbose:
+            print(f"Saving {len(tracks)} tracks to Spotify...")
         ids = [track.source_id.split(":")[-1] for track in tracks]
         effective_batch_size = min(batch_size, 50)
         chunks = batched(ids, effective_batch_size)
         for index, chunk in enumerate(chunks):
+            if verbose:
+                print(f"  [SAVE] Batch {index+1}/{len(chunks)} ({len(chunk)} tracks)")
             retry_spotify_call(
                 lambda chunk=chunk: self.client.current_user_saved_tracks_add(tracks=chunk),
                 label="Spotify current_user_saved_tracks_add",

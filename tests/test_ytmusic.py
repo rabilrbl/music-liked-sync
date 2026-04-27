@@ -51,7 +51,8 @@ def test_youtube_likes_are_batched_with_configurable_delay():
 
     backend.like_tracks(tracks, batch_size=2, batch_delay=0.25, sleep_fn=sleeps.append)
 
-    assert backend.client.calls == [(f"yt{i}", "LIKE") for i in range(5)]
+    assert sorted(backend.client.calls) == sorted([(f"yt{i}", "LIKE") for i in range(5)])
+
     assert sleeps == [0.25, 0.25]
 
 

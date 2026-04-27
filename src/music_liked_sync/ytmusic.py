@@ -1,7 +1,9 @@
 import json
 import sys
+import threading
 import time
 from collections.abc import Callable, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from hashlib import sha1
 from pathlib import Path
 
@@ -226,13 +228,18 @@ class YTMusicBackend:
         self.mode = "browser-session"
         self.client = YTMusic(auth_headers)
 
-    def liked_tracks(self, limit: int | None = None) -> list[Track]:
+    def liked_tracks(self, limit: int | None = None, verbose: bool = False) -> list[Track]:
+        if verbose:
+            print("Fetching YouTube Music liked songs...")
         result = retry_ytm_call(
             lambda: self.client.get_liked_songs(limit=limit or 10000),
             label="YTM get_liked_songs",
         )
         items = result.get("tracks", []) if isinstance(result, dict) else result
-        return [t for t in (parse_ytm_track(item) for item in (items or [])) if t]
+        tracks = [t for t in (parse_ytm_track(item) for item in (items or [])) if t]
+        if verbose:
+            print(f"  Finished fetching {len(tracks)} tracks from YouTube Music")
+        return tracks
 
     def search_track(self, wanted: Track, limit: int = 5) -> list[Track]:
         query = f"{wanted.title} {' '.join(wanted.artists)}".strip()
@@ -249,12 +256,33 @@ class YTMusicBackend:
         batch_size: int = DEFAULT_BATCH_SIZE,
         batch_delay: float = DEFAULT_BATCH_DELAY,
         sleep_fn: Callable[[float], None] = time.sleep,
+        max_workers: int = 4,
+        verbose: bool = False,
     ) -> None:
+        if verbose:
+            print(f"Liking {len(tracks)} tracks on YouTube Music...")
         chunks = batched(tracks, batch_size)
-        for index, chunk in enumerate(chunks):
-            for track in chunk:
-                retry_ytm_call(
-                    lambda track_id=track.source_id: self.client.rate_song(track_id, "LIKE"),
-                    label=f"YTM rate_song {track.source_id}",
-                )
-            sleep_between_batches(index, len(chunks), batch_delay, sleep_fn)
+        print_lock = threading.Lock()
+
+        def vprint_track(track_id):
+            if verbose:
+                with print_lock:
+                    print(f"  [LIKE] {track_id}")
+
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            for index, chunk in enumerate(chunks):
+                if verbose:
+                    print(f"  Batch {index+1}/{len(chunks)} ({len(chunk)} tracks)")
+                futures = []
+                for track in chunk:
+                    def make_call(t=track):
+                        vprint_track(t.source_id)
+                        return retry_ytm_call(
+                            lambda: self.client.rate_song(t.source_id, "LIKE"),
+                            label=f"YTM rate_song {t.source_id}",
+                        )
+                    futures.append(executor.submit(make_call))
+                
+                for future in futures:
+                    future.result()
+                sleep_between_batches(index, len(chunks), batch_delay, sleep_fn)
