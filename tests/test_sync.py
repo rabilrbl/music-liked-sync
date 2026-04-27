@@ -17,6 +17,15 @@ def test_resolve_matches_continues_when_search_errors_transiently():
     assert unmatched == wanted
 
 
+def test_resolve_matches_raises_runtime_error():
+    import pytest
+    wanted = [Track(title="T", artists=("A",), source_id="1")]
+    def search_fn(_track):
+        raise RuntimeError("fatal")
+    with pytest.raises(RuntimeError, match="fatal"):
+        resolve_matches(wanted, search_fn, None, "test")
+
+
 def test_resolve_matches_uses_cache_before_search(tmp_path):
     wanted = [
         Track(title="Believer", artists=("Imagine Dragons",), source_id="spotify:track:1")
