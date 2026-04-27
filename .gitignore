@@ -17,3 +17,8 @@ sync-report.json
 
 # Persistent runtime state
 state/
+
+# Build artifacts
+*.egg-info/
+build/
+dist/
