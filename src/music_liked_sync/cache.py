@@ -1,3 +1,4 @@
+import contextlib
 import json
 import sqlite3
 import time
@@ -13,7 +14,8 @@ class SyncCache:
     def __init__(self, path: Path) -> None:
         self.path = path
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        with self._connect() as conn:
+        conn = self._connect()
+        with contextlib.closing(conn):
             conn.execute("PRAGMA journal_mode=WAL")
             conn.execute(
                 """
@@ -49,7 +51,7 @@ class SyncCache:
             conn.commit()
 
     def _connect(self) -> sqlite3.Connection:
-        return sqlite3.connect(self.path)
+        return sqlite3.connect(self.path, check_same_thread=False)
 
     @staticmethod
     def _serialize_track(track: Track) -> str:
@@ -69,7 +71,8 @@ class SyncCache:
     def store_match(self, direction: str, source: Track, target: Track) -> None:
         source_key = normalize_key(source.title, source.artists)
         now = time.time()
-        with self._connect() as conn:
+        conn = self._connect()
+        with contextlib.closing(conn):
             conn.execute(
                 """
                 INSERT INTO matches(direction, source_key, source_track_json, target_track_json, updated_at)
@@ -91,7 +94,8 @@ class SyncCache:
 
     def get_match(self, direction: str, source: Track) -> Track | None:
         source_key = normalize_key(source.title, source.artists)
-        with self._connect() as conn:
+        conn = self._connect()
+        with contextlib.closing(conn):
             row = conn.execute(
                 "SELECT target_track_json FROM matches WHERE direction = ? AND source_key = ?",
                 (direction, source_key),
@@ -111,7 +115,8 @@ class SyncCache:
         rows = [(service, source_id, now) for source_id in sorted(set(source_ids)) if source_id]
         if not rows:
             return
-        with self._connect() as conn:
+        conn = self._connect()
+        with contextlib.closing(conn):
             conn.executemany(
                 """
                 INSERT INTO liked_tracks(service, source_id, updated_at)
@@ -124,7 +129,8 @@ class SyncCache:
             conn.commit()
 
     def is_liked(self, service: str, source_id: str) -> bool:
-        with self._connect() as conn:
+        conn = self._connect()
+        with contextlib.closing(conn):
             row = conn.execute(
                 "SELECT 1 FROM liked_tracks WHERE service = ? AND source_id = ? LIMIT 1",
                 (service, source_id),
@@ -134,7 +140,8 @@ class SyncCache:
     def store_library(self, service: str, tracks: Sequence[Track]) -> None:
         payload = json.dumps([asdict(track) for track in tracks], ensure_ascii=False)
         now = time.time()
-        with self._connect() as conn:
+        conn = self._connect()
+        with contextlib.closing(conn):
             conn.execute(
                 """
                 INSERT INTO library_cache(service, tracks_json, fetched_at)
@@ -150,7 +157,8 @@ class SyncCache:
     def get_library(self, service: str, max_age_seconds: float) -> list[Track] | None:
         if max_age_seconds <= 0:
             return None
-        with self._connect() as conn:
+        conn = self._connect()
+        with contextlib.closing(conn):
             row = conn.execute(
                 "SELECT tracks_json, fetched_at FROM library_cache WHERE service = ?",
                 (service,),
