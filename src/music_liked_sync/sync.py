@@ -2,7 +2,7 @@ import sys
 import threading
 import time
 from collections.abc import Callable, Sequence
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor
 
 from .cache import SyncCache
 from .constants import DEFAULT_BATCH_DELAY, DEFAULT_BATCH_SIZE

@@ -7,7 +7,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from collections.abc import Callable, Sequence
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from .constants import (

@@ -2,7 +2,7 @@ import json
 import sys
 import time
 from collections.abc import Callable, Sequence
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor
 from hashlib import sha1
 from pathlib import Path
 
