@@ -1,6 +1,8 @@
+import argparse
+import pytest
 import music_liked_sync.cli
 from music_liked_sync.models import Track
-from music_liked_sync.cli import build_arg_parser
+from music_liked_sync.cli import build_arg_parser, positive_int, non_negative_float
 
 
 def test_parser_rejects_removed_legacy_auth_flags():
@@ -61,7 +63,10 @@ def test_main_returns_2_when_browser_session_setup_fails(monkeypatch, tmp_path, 
 def test_main_returns_2_when_spotify_init_fails(monkeypatch, tmp_path, capsys):
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(music_liked_sync.cli, "ensure_yt_browser_auth_from_session", lambda **kwargs: {})
-    def fail(*args, **kwargs): raise RuntimeError("spotify fail")
+
+    def fail(*args, **kwargs):
+        raise RuntimeError("spotify fail")
+
     monkeypatch.setattr(music_liked_sync.cli, "SpotifyBackend", fail)
     assert music_liked_sync.cli.main([]) == 2
     assert "spotify fail" in capsys.readouterr().err
@@ -71,7 +76,10 @@ def test_main_returns_2_when_ytm_init_fails(monkeypatch, tmp_path, capsys):
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(music_liked_sync.cli, "ensure_yt_browser_auth_from_session", lambda **kwargs: {})
     monkeypatch.setattr(music_liked_sync.cli, "SpotifyBackend", lambda **kwargs: None)
-    def fail(*args, **kwargs): raise ValueError("ytm init fail")
+
+    def fail(*args, **kwargs):
+        raise ValueError("ytm init fail")
+
     monkeypatch.setattr(music_liked_sync.cli, "YTMusicBackend", fail)
     assert music_liked_sync.cli.main([]) == 2
     assert "ytm init fail" in capsys.readouterr().err
@@ -80,14 +88,25 @@ def test_main_returns_2_when_ytm_init_fails(monkeypatch, tmp_path, capsys):
 def test_main_returns_2_when_ytm_liked_tracks_fails(monkeypatch, tmp_path, capsys):
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(music_liked_sync.cli, "ensure_yt_browser_auth_from_session", lambda **kwargs: {})
+
     class MockSpotify:
         mode = "web-session"
-        def __init__(self, **kwargs): pass
-        def liked_tracks(self): return []
+
+        def __init__(self, **kwargs):
+            pass
+
+        def liked_tracks(self):
+            return []
+
     class MockYTM:
         mode = "browser-session"
-        def __init__(self, auth): pass
-        def liked_tracks(self): raise RuntimeError("ytm fetch fail")
+
+        def __init__(self, auth):
+            pass
+
+        def liked_tracks(self):
+            raise RuntimeError("ytm fetch fail")
+
     monkeypatch.setattr(music_liked_sync.cli, "SpotifyBackend", MockSpotify)
     monkeypatch.setattr(music_liked_sync.cli, "YTMusicBackend", MockYTM)
     assert music_liked_sync.cli.main([]) == 2
@@ -99,16 +118,31 @@ def test_main_returns_2_when_ytm_like_tracks_fails(monkeypatch, tmp_path, capsys
     source = Track(title="S1", artists=("A1",), source_id="s1")
     target = Track(title="Y1", artists=("A1",), source_id="y1")
     monkeypatch.setattr(music_liked_sync.cli, "ensure_yt_browser_auth_from_session", lambda **kwargs: {})
+
     class MockSpotify:
         mode = "web-session"
-        def __init__(self, **kwargs): pass
-        def liked_tracks(self): return [source]
+
+        def __init__(self, **kwargs):
+            pass
+
+        def liked_tracks(self):
+            return [source]
+
     class MockYTM:
         mode = "browser-session"
-        def __init__(self, auth): pass
-        def liked_tracks(self): return []
-        def search_track(self, wanted): return [target]
-        def like_tracks(self, tracks, **kwargs): raise RuntimeError("ytm like fail")
+
+        def __init__(self, auth):
+            pass
+
+        def liked_tracks(self):
+            return []
+
+        def search_track(self, wanted):
+            return [target]
+
+        def like_tracks(self, tracks, **kwargs):
+            raise RuntimeError("ytm like fail")
+
     monkeypatch.setattr(music_liked_sync.cli, "SpotifyBackend", MockSpotify)
     monkeypatch.setattr(music_liked_sync.cli, "YTMusicBackend", MockYTM)
     assert music_liked_sync.cli.main(["--apply", "--spotify-to-ytm"]) == 2
@@ -117,44 +151,57 @@ def test_main_returns_2_when_ytm_like_tracks_fails(monkeypatch, tmp_path, capsys
 
 def test_main_success_full_sync(monkeypatch, tmp_path, capsys):
     monkeypatch.chdir(tmp_path)
-    
+
     spotify_track = Track(title="S1", artists=("A1",), source_id="s1")
     ytm_track = Track(title="Y1", artists=("A2",), source_id="y1")
-    
+
     monkeypatch.setattr(music_liked_sync.cli, "ensure_yt_browser_auth_from_session", lambda **kwargs: {"cookie": "c"})
-    
+
     class MockSpotify:
         mode = "web-session"
-        def __init__(self, **kwargs): pass
-        def liked_tracks(self): return [spotify_track]
-        def search_track(self, wanted): return [spotify_track]
-        def save_tracks(self, tracks, **kwargs): pass
-        
+
+        def __init__(self, **kwargs):
+            pass
+
+        def liked_tracks(self):
+            return [spotify_track]
+
+        def search_track(self, wanted):
+            return [spotify_track]
+
+        def save_tracks(self, tracks, **kwargs):
+            pass
+
     class MockYTM:
         mode = "browser-session"
-        def __init__(self, auth): pass
-        def liked_tracks(self): return [ytm_track]
-        def search_track(self, wanted): return [ytm_track]
-        def like_tracks(self, tracks, **kwargs): pass
+
+        def __init__(self, auth):
+            pass
+
+        def liked_tracks(self):
+            return [ytm_track]
+
+        def search_track(self, wanted):
+            return [ytm_track]
+
+        def like_tracks(self, tracks, **kwargs):
+            pass
 
     monkeypatch.setattr(music_liked_sync.cli, "SpotifyBackend", MockSpotify)
     monkeypatch.setattr(music_liked_sync.cli, "YTMusicBackend", MockYTM)
-    
+
     status = music_liked_sync.cli.main(["--apply", "--cache-db", "cache.db"])
     assert status == 0
-    
+
     # Check if report was written
     assert (tmp_path / "sync-report.json").exists()
-    
+
     # Run again to test library cache read
     status = music_liked_sync.cli.main(["--apply", "--cache-db", "cache.db", "--cache-library-ttl", "3600"])
     assert status == 0
 
 
 def test_positive_int_validator():
-    from music_liked_sync.cli import positive_int
-    import argparse
-    import pytest
     assert positive_int("5") == 5
     with pytest.raises(argparse.ArgumentTypeError):
         positive_int("0")
@@ -163,10 +210,21 @@ def test_positive_int_validator():
 
 
 def test_non_negative_float_validator():
-    from music_liked_sync.cli import non_negative_float
-    import argparse
-    import pytest
     assert non_negative_float("0.5") == 0.5
     assert non_negative_float("0") == 0.0
     with pytest.raises(argparse.ArgumentTypeError):
         non_negative_float("-0.1")
+
+
+def test_parser_accepts_sync_cache_flags():
+    args = build_arg_parser().parse_args(
+        [
+            "--cache-db",
+            "state/sync.sqlite3",
+            "--no-cache-read",
+            "--no-cache-write",
+        ]
+    )
+    assert args.cache_db == "state/sync.sqlite3"
+    assert args.cache_read is False
+    assert args.cache_write is False
