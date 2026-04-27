@@ -24,4 +24,4 @@ jobs:
       - name: Tests
         run: uv run pytest -q
       - name: Compile
-        run: uv run python -m py_compile src/music_liked_sync.py
+        run: uv run python -m py_compile src/music_liked_sync/*.py

@@ -9,9 +9,16 @@ dependencies = [
   "ytmusicapi>=1.11.5",
 ]
 
+[project.scripts]
+music-liked-sync = "music_liked_sync.cli:main"
+
+[tool.uv]
+package = true
+
 [dependency-groups]
 dev = [
   "pytest>=8.0",
+  "pytest-cov>=7.1.0",
   "ruff>=0.15.12",
 ]
 
