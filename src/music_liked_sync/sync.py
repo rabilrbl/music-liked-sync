@@ -10,22 +10,50 @@ from .models import Track
 from .utils import (
     batched,
     best_match,
+    normalize_artist,
     normalize_key,
     sleep_between_batches,
+    unique_by_key,
 )
 
 
-def compute_missing(left: Sequence[Track], right: Sequence[Track]) -> list[Track]:
+def compute_missing(left: Sequence[Track], right: Sequence[Track], verbose: bool = False) -> list[Track]:
     right_keys = {normalize_key(track.title, track.artists) for track in right}
+
+    # Pre-index right library by normalized artist for faster fuzzy lookups
+    right_by_artist: dict[str, list[Track]] = {}
+    for track in right:
+        for artist in track.artists:
+            norm_a = normalize_artist(artist)
+            if norm_a:
+                right_by_artist.setdefault(norm_a, []).append(track)
+
     missing = []
-    for track in left:
+    for i, track in enumerate(left):
+        if verbose and i % 100 == 0 and i > 0:
+            print(f"  Comparing track {i}/{len(left)}...", end="\r", flush=True)
+
         key = normalize_key(track.title, track.artists)
         if key in right_keys:
             continue
-        # Fallback: fuzzy check against the whole library for nearly identical tracks
-        if best_match(track, right):
+
+        # Fallback: fuzzy check only against tracks with at least one matching artist
+        possible_candidates = []
+        seen_ids = set()
+        for artist in track.artists:
+            norm_a = normalize_artist(artist)
+            for cand in right_by_artist.get(norm_a, []):
+                if cand.source_id not in seen_ids:
+                    possible_candidates.append(cand)
+                    seen_ids.add(cand.source_id)
+
+        if possible_candidates and best_match(track, possible_candidates):
             continue
+
         missing.append(track)
+
+    if verbose:
+        print("".ljust(90), end="\r")
     return missing
 
 

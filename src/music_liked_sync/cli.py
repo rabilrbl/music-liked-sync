@@ -144,7 +144,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     }
 
     if do_spotify_to_ytm:
-        missing = compute_missing(spotify_liked, ytm_liked)
+        missing = compute_missing(spotify_liked, ytm_liked, verbose=args.verbose)
         vprint(f"Spotify → YTM: {len(missing)} tracks missing in YTM")
         matched, unmatched = resolve_matches(
             missing,
@@ -187,7 +187,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         }
 
     if do_ytm_to_spotify:
-        missing = compute_missing(ytm_liked, spotify_liked)
+        missing = compute_missing(ytm_liked, spotify_liked, verbose=args.verbose)
         vprint(f"YTM → Spotify: {len(missing)} tracks missing in Spotify")
         matched, unmatched = resolve_matches(
             missing,
