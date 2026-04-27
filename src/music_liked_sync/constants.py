@@ -3,7 +3,8 @@ import re
 COMMON_TITLE_SUFFIX_RE = re.compile(
     r"\s*(?:[-–—:]\s*)?\(?\b(?:remaster(?:ed)?(?:\s*\d{2,4})?|\d{4}\s*remaster(?:ed)?|"
     r"deluxe(?:\s+edition)?|expanded(?:\s+edition)?|explicit|clean|single version|album version|"
-    r"radio edit|edit|live|mono|stereo|from .*|official audio|official video)\b\)?\s*$",
+    r"radio edit|edit|live|mono|stereo|from .*|official audio|official video|official music video|"
+    r"official lyric video|lyric video|lyrics|audio only|video only|music video)\b\)?\s*$",
     re.IGNORECASE,
 )
 DEFAULT_MARKET = "IN"

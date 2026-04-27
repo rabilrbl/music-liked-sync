@@ -17,8 +17,17 @@ from .utils import (
 
 
 def compute_missing(left: Sequence[Track], right: Sequence[Track]) -> list[Track]:
-    right_keys = set(unique_by_key(right))
-    return [track for track in left if normalize_key(track.title, track.artists) not in right_keys]
+    right_keys = {normalize_key(track.title, track.artists) for track in right}
+    missing = []
+    for track in left:
+        key = normalize_key(track.title, track.artists)
+        if key in right_keys:
+            continue
+        # Fallback: fuzzy check against the whole library for nearly identical tracks
+        if best_match(track, right):
+            continue
+        missing.append(track)
+    return missing
 
 
 def resolve_matches(

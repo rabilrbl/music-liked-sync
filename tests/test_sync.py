@@ -1,6 +1,21 @@
-from music_liked_sync.sync import resolve_matches
+from music_liked_sync.sync import resolve_matches, compute_missing
 from music_liked_sync.models import Track
 from music_liked_sync.cache import SyncCache
+
+
+def test_compute_missing_preserves_duplicates_on_left_and_handles_fuzzy():
+    t1 = Track(title="You And Me", artists=("Artist",), source_id="s1")
+    t2 = Track(title="U and Me", artists=("Artist",), source_id="s2")
+    t3 = Track(title="Different", artists=("Artist",), source_id="s3")
+    
+    # If t1 is in 'right', t2 should also be considered matched due to fuzzy matching
+    missing = compute_missing([t1, t2, t3], [t1])
+    assert len(missing) == 1
+    assert missing[0].source_id == "s3"
+
+    # Exact match check
+    missing2 = compute_missing([t1], [t1])
+    assert len(missing2) == 0
 
 
 def test_resolve_matches_continues_when_search_errors_transiently():

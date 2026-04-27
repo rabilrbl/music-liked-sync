@@ -18,13 +18,25 @@ def _ascii_lower(value: str) -> str:
 def normalize_text(value: str) -> str:
     text = _ascii_lower(value)
     text = text.replace("&", " and ")
-    text = re.sub(r"\b(feat|ft|featuring)\.?\b.*$", "", text)
+    # Handle common abbreviations
+    text = re.sub(r"\bu\b", "you", text)
+    text = re.sub(r"\br\b", "are", text)
+    text = re.sub(r"\bw/\b", "with", text)
+    text = re.sub(r"\bw/o\b", "without", text)
+    
+    # Remove featuring artist parts from title
+    text = re.sub(r"\s+\(?(?:feat|ft|featuring)\.?\s+.*$", "", text)
+    
     previous = None
     while previous != text:
         previous = text
         text = COMMON_TITLE_SUFFIX_RE.sub("", text)
+    
+    # Remove any remaining content in parentheses/brackets that often contains metadata
     text = re.sub(r"\([^)]*\)|\[[^]]*\]", " ", text)
-    text = re.sub(r"[^a-z0-9]+", " ", text)
+    
+    # Remove everything except alphanumeric and spaces
+    text = re.sub(r"[^a-z0-9\s]+", " ", text)
     text = re.sub(r"\s+", " ", text).strip()
     return text
 
