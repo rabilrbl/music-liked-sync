@@ -1,0 +1,72 @@
+from music_liked_sync.sync import resolve_matches
+from music_liked_sync.models import Track
+from music_liked_sync.cache import SyncCache
+
+
+def test_resolve_matches_continues_when_search_errors_transiently():
+    wanted = [
+        Track(title="Believer", artists=("Imagine Dragons",), source_id="spotify:track:1")
+    ]
+
+    def search_fn(_track):
+        raise ValueError("temporary non-json response")
+
+    matched, unmatched = resolve_matches(wanted, search_fn, None, "Spotify → YTM")
+
+    assert matched == []
+    assert unmatched == wanted
+
+
+def test_resolve_matches_uses_cache_before_search(tmp_path):
+    wanted = [
+        Track(title="Believer", artists=("Imagine Dragons",), source_id="spotify:track:1")
+    ]
+    cached_match = Track(title="Believer", artists=("Imagine Dragons",), source_id="yt1")
+    cache = SyncCache(tmp_path / "sync-cache.sqlite3")
+    cache.store_match("spotify_to_ytm", wanted[0], cached_match)
+
+    calls = {"search": 0}
+
+    def search_fn(_track):
+        calls["search"] += 1
+        return []
+
+    matched, unmatched = resolve_matches(
+        wanted,
+        search_fn,
+        None,
+        "Spotify → YTM",
+        cache=cache,
+        cache_direction="spotify_to_ytm",
+    )
+
+    assert len(matched) == 1
+    assert matched[0][1].source_id == "yt1"
+    assert unmatched == []
+    assert calls["search"] == 0
+
+
+def test_resolve_matches_persists_new_match_to_cache(tmp_path):
+    wanted = [
+        Track(title="Believer", artists=("Imagine Dragons",), source_id="spotify:track:1")
+    ]
+    discovered = Track(title="Believer", artists=("Imagine Dragons",), source_id="yt1")
+    cache = SyncCache(tmp_path / "sync-cache.sqlite3")
+
+    def search_fn(_track):
+        return [discovered]
+
+    matched, unmatched = resolve_matches(
+        wanted,
+        search_fn,
+        None,
+        "Spotify → YTM",
+        cache=cache,
+        cache_direction="spotify_to_ytm",
+    )
+
+    assert len(matched) == 1
+    assert unmatched == []
+    loaded = cache.get_match("spotify_to_ytm", wanted[0])
+    assert loaded is not None
+    assert loaded.source_id == "yt1"
