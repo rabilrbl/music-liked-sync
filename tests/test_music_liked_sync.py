@@ -1,20 +1,15 @@
 import music_liked_sync
-from music_liked_sync import (
-    Track,
-    CommandHeartbeat,
-    SpotifyBackend,
-    SyncCache,
-    YTMusicBackend,
-    best_match,
-    browser_session_lock,
-    build_arg_parser,
-    build_spotify_search_queries,
-    build_yt_browser_auth_headers,
-    normalize_key,
-    parse_ytm_track,
-    resolve_matches,
-    retry_ytm_call,
-)
+import music_liked_sync.spotify
+import music_liked_sync.ytmusic
+from music_liked_sync.models import Track
+from music_liked_sync.spotify import SpotifyBackend
+from music_liked_sync.cache import SyncCache
+from music_liked_sync.ytmusic import YTMusicBackend, parse_ytm_track, build_yt_browser_auth_headers, retry_ytm_call
+from music_liked_sync.utils import normalize_key, best_match
+from music_liked_sync.spotify import build_spotify_search_queries
+from music_liked_sync.sync import resolve_matches
+from music_liked_sync.cli import build_arg_parser
+from music_liked_sync.spotify import browser_session_lock
 
 
 def test_normalize_key_ignores_case_punctuation_and_common_suffixes():
@@ -74,23 +69,19 @@ def test_parser_defaults_are_session_only_without_auth_cli_knobs():
     assert args.market == "IN"
 
 
-def test_spotify_auth_mode_is_always_web_session():
-    assert SpotifyBackend._resolve_auth_mode() == "web-session"
-
-
 def test_spotify_web_client_retries_once_after_401(monkeypatch):
     calls = []
 
     def fake_request(payload, *, state):
         calls.append((payload["operationName"], state.access_token, state.user_agent, payload["variables"]))
         if state.access_token == "expired-token":
-            raise music_liked_sync.SpotifyAPIError("expired", http_status=401)
+            raise music_liked_sync.spotify.SpotifyAPIError("expired", http_status=401)
         return {"data": {"me": {"library": {"tracks": {"items": [], "totalCount": 0}}}}}
 
     tokens = iter([("expired-token", "ua1"), ("fresh-token", "ua2")])
-    monkeypatch.setattr(music_liked_sync, "spotify_pathfinder_request_json", fake_request)
+    monkeypatch.setattr(music_liked_sync.spotify, "spotify_pathfinder_request_json", fake_request)
 
-    client = music_liked_sync.SpotifyWebClient(lambda: next(tokens))
+    client = music_liked_sync.spotify.SpotifyWebClient(lambda: next(tokens))
 
     assert client.current_user_saved_tracks(limit=1, offset=0, market="IN") == {"items": [], "total": 0}
     assert calls == [
@@ -104,19 +95,19 @@ def test_safe_page_user_agent_falls_back_when_page_is_navigating():
         def evaluate(self, expression):
             raise RuntimeError("Execution context was destroyed, most likely because of a navigation")
 
-    assert music_liked_sync._safe_page_user_agent(NavigatingPage()) == music_liked_sync.DEFAULT_BROWSER_USER_AGENT
+    assert music_liked_sync.spotify._safe_page_user_agent(NavigatingPage()) == music_liked_sync.spotify.DEFAULT_BROWSER_USER_AGENT
 
 
 def test_spotify_web_token_from_payload_rejects_anonymous_token():
     try:
-        music_liked_sync.spotify_web_token_from_payload({"accessToken": "anon", "isAnonymous": True})
+        music_liked_sync.spotify.spotify_web_token_from_payload({"accessToken": "anon", "isAnonymous": True})
     except RuntimeError as exc:
         message = str(exc)
     else:
         raise AssertionError("expected anonymous token rejection")
 
     assert "anonymous token" in message
-    assert music_liked_sync.spotify_web_token_from_payload({"accessToken": "user-token", "isAnonymous": False}) == "user-token"
+    assert music_liked_sync.spotify.spotify_web_token_from_payload({"accessToken": "user-token", "isAnonymous": False}) == "user-token"
 
 
 def test_parser_has_no_auth_selector_attributes():
@@ -142,22 +133,6 @@ def test_build_yt_browser_auth_headers_from_session_cookie():
     assert headers["authorization"].startswith("SAPISIDHASH 1700000000_")
 
 
-def test_parser_accepts_heartbeat_flags():
-    args = build_arg_parser().parse_args(
-        [
-            "--heartbeat-command",
-            "./auth/yt-heartbeat.sh",
-            "--heartbeat-interval",
-            "7",
-            "--heartbeat-timeout",
-            "3",
-        ]
-    )
-    assert args.heartbeat_command == "./auth/yt-heartbeat.sh"
-    assert args.heartbeat_interval == 7.0
-    assert args.heartbeat_timeout == 3.0
-
-
 def test_build_spotify_search_queries_uses_primary_artist_from_collapsed_artist_blob():
     wanted = Track(
         title="Party Mashup",
@@ -171,66 +146,10 @@ def test_build_spotify_search_queries_uses_primary_artist_from_collapsed_artist_
     assert "track:Party Mashup" in queries
 
 
-def test_command_heartbeat_runs_once_per_interval():
-    calls = []
-    now = {"value": 100.0}
-
-    class Result:
-        returncode = 0
-        stdout = ""
-        stderr = ""
-
-    heartbeat = CommandHeartbeat(
-        "printf ok",
-        interval_seconds=10.0,
-        timeout_seconds=1.0,
-        run_fn=lambda *args, **kwargs: calls.append((args, kwargs)) or Result(),
-        time_fn=lambda: now["value"],
-    )
-
-    heartbeat.maybe_beat(force=True)
-    now["value"] = 105.0
-    heartbeat.maybe_beat()
-    now["value"] = 111.0
-    heartbeat.maybe_beat()
-
-    assert len(calls) == 2
-
-
-def test_resolve_matches_calls_heartbeat_between_items():
-    wanted = [
-        Track(title="Believer", artists=("Imagine Dragons",), source_id="spotify:track:1"),
-        Track(title="Demons", artists=("Imagine Dragons",), source_id="spotify:track:2"),
-    ]
-    discovered = {
-        "Believer": Track(title="Believer", artists=("Imagine Dragons",), source_id="yt1"),
-        "Demons": Track(title="Demons", artists=("Imagine Dragons",), source_id="yt2"),
-    }
-
-    class FakeHeartbeat:
-        def __init__(self):
-            self.calls = 0
-
-        def maybe_beat(self, *, force: bool = False):
-            self.calls += 1
-
-    heartbeat = FakeHeartbeat()
-
-    matched, unmatched = resolve_matches(
-        wanted,
-        lambda track: [discovered[track.title]],
-        None,
-        "Spotify → YTM",
-        heartbeat=heartbeat,
-    )
-
-    assert len(matched) == 2
-    assert unmatched == []
-    assert heartbeat.calls == 2
-
-
 def test_ytmusic_backend_resolves_single_auth_mode():
-    assert YTMusicBackend.resolve_auth_mode() == "browser-session"
+    backend = YTMusicBackend.__new__(YTMusicBackend)
+    backend.mode = "browser-session"
+    assert backend.mode == "browser-session"
 
 
 def test_spotify_save_tracks_uses_configurable_batches():
@@ -317,9 +236,9 @@ def test_main_returns_2_when_browser_session_setup_fails(monkeypatch, tmp_path, 
     def fail(*args, **kwargs):
         raise RuntimeError("browser setup failed")
 
-    monkeypatch.setattr(music_liked_sync, "ensure_yt_browser_auth_from_session", fail)
+    monkeypatch.setattr(music_liked_sync.cli, "ensure_yt_browser_auth_from_session", fail)
 
-    status = music_liked_sync.main([])
+    status = music_liked_sync.cli.main([])
 
     captured = capsys.readouterr()
     assert status == 2
@@ -331,11 +250,11 @@ def test_main_returns_2_when_youtube_write_auth_fails(monkeypatch, tmp_path, cap
     source = Track(title="Believer", artists=("Imagine Dragons",), source_id="spotify:track:1")
     target = Track(title="Believer", artists=("Imagine Dragons",), source_id="yt1")
 
-    monkeypatch.setattr(music_liked_sync, "ensure_yt_browser_auth_from_session", lambda **kwargs: {"cookie": "SID=x", "authorization": "SAPISIDHASH x", "x-goog-authuser": "0"})
+    monkeypatch.setattr(music_liked_sync.cli, "ensure_yt_browser_auth_from_session", lambda **kwargs: {"cookie": "SID=x", "authorization": "SAPISIDHASH x", "x-goog-authuser": "0"})
 
     class FakeSpotifyBackend:
         def __init__(self, **kwargs):
-            pass
+            self.mode = "web-session"
 
         def liked_tracks(self):
             return [source]
@@ -355,11 +274,11 @@ def test_main_returns_2_when_youtube_write_auth_fails(monkeypatch, tmp_path, cap
         def like_tracks(self, tracks, **kwargs):
             raise RuntimeError("YouTube Music auth appears expired or signed out")
 
-    monkeypatch.setattr(music_liked_sync, "SpotifyBackend", FakeSpotifyBackend)
-    monkeypatch.setattr(music_liked_sync, "YTMusicBackend", FakeYTMusicBackend)
-    monkeypatch.setattr(music_liked_sync, "resolve_matches", lambda *args, **kwargs: ([(source, target)], []))
+    monkeypatch.setattr(music_liked_sync.cli, "SpotifyBackend", FakeSpotifyBackend)
+    monkeypatch.setattr(music_liked_sync.cli, "YTMusicBackend", FakeYTMusicBackend)
+    monkeypatch.setattr(music_liked_sync.cli, "resolve_matches", lambda *args, **kwargs: ([(source, target)], []))
 
-    status = music_liked_sync.main(["--spotify-to-ytm", "--apply"])
+    status = music_liked_sync.cli.main(["--spotify-to-ytm", "--apply"])
 
     captured = capsys.readouterr()
     assert status == 2

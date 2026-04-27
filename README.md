@@ -55,46 +55,46 @@ The active YouTube Music browser session is protected by `state/locks/ytmusic-br
 ## Dry-run (default)
 
 ```bash
-uv run python src/music_liked_sync.py
+uv run music-liked-sync
 ```
 
 ## Apply bidirectional sync
 
 ```bash
-uv run python src/music_liked_sync.py --apply
+uv run music-liked-sync --apply
 ```
 
 ## Direction-specific
 
 ```bash
 # Spotify -> YouTube Music
-uv run python src/music_liked_sync.py --spotify-to-ytm --apply
+uv run music-liked-sync --spotify-to-ytm --apply
 
 # YouTube Music -> Spotify
-uv run python src/music_liked_sync.py --ytm-to-spotify --apply
+uv run music-liked-sync --ytm-to-spotify --apply
 ```
 
 ## Batching and caps
 
 ```bash
 # smaller batches + longer pause
-uv run python src/music_liked_sync.py --batch-size 25 --batch-delay 2 --apply
+uv run music-liked-sync --batch-size 25 --batch-delay 2 --apply
 
 # optional per-direction cap
-uv run python src/music_liked_sync.py --max-add 100 --apply
+uv run music-liked-sync --max-add 100 --apply
 ```
 
 ## Cache controls
 
 ```bash
 # custom sqlite path
-uv run python src/music_liked_sync.py --cache-db state/my-sync.sqlite3
+uv run music-liked-sync --cache-db state/my-sync.sqlite3
 
 # reuse cached library snapshots for 30m
-uv run python src/music_liked_sync.py --cache-library-ttl 1800
+uv run music-liked-sync --cache-library-ttl 1800
 
 # disable cache read/write
-uv run python src/music_liked_sync.py --no-cache-read --no-cache-write
+uv run music-liked-sync --no-cache-read --no-cache-write
 ```
 
 ## CLI options
@@ -111,10 +111,6 @@ uv run python src/music_liked_sync.py --no-cache-read --no-cache-write
 --no-cache-read
 --no-cache-write
 
---heartbeat-command CMD
---heartbeat-interval FLOAT
---heartbeat-timeout FLOAT
-
 --spotify-to-ytm
 --ytm-to-spotify
 --report sync-report.json
@@ -126,7 +122,7 @@ uv run python src/music_liked_sync.py --no-cache-read --no-cache-write
 uv sync --all-groups
 uv run ruff check .
 uv run pytest -q
-uv run python -m py_compile src/music_liked_sync.py
+uv run music-liked-sync --help
 ```
 
 ## License
