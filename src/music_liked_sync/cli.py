@@ -52,11 +52,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--ytm-to-spotify", action="store_true", help="only sync YouTube Music liked songs into Spotify")
     parser.add_argument("--report", default="sync-report.json", help="write JSON report here")
     parser.add_argument("--workers", type=positive_int, default=int(os.environ.get("MUSIC_SYNC_WORKERS", "4")), help="concurrency for searches and library fetching")
+    parser.add_argument("--verbose", action="store_true", help="enable detailed logging")
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_arg_parser().parse_args(argv)
+
+    def vprint(*msg, **kwargs):
+        if args.verbose:
+            print(*msg, **kwargs)
 
     yt_browser_session_dir = Path(DEFAULT_YT_BROWSER_SESSION_DIR).expanduser()
     if not yt_browser_session_dir.is_absolute():
@@ -98,19 +103,23 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     spotify_liked = cache.get_library("spotify", args.cache_library_ttl) if args.cache_read else None
     if spotify_liked is None:
-        spotify_liked = spotify.liked_tracks(max_workers=args.workers)
+        spotify_liked = spotify.liked_tracks(max_workers=args.workers, verbose=args.verbose)
         if args.cache_write:
             cache.store_library("spotify", spotify_liked)
+    else:
+        vprint(f"Loaded {len(spotify_liked)} Spotify tracks from cache")
 
     ytm_liked = cache.get_library("ytm", args.cache_library_ttl) if args.cache_read else None
     if ytm_liked is None:
         try:
-            ytm_liked = ytm.liked_tracks()
+            ytm_liked = ytm.liked_tracks(verbose=args.verbose)
         except RuntimeError as exc:
             print(str(exc), file=sys.stderr)
             return 2
         if args.cache_write:
             cache.store_library("ytm", ytm_liked)
+    else:
+        vprint(f"Loaded {len(ytm_liked)} YouTube Music tracks from cache")
 
     do_spotify_to_ytm = args.spotify_to_ytm or not args.ytm_to_spotify
     do_ytm_to_spotify = args.ytm_to_spotify or not args.spotify_to_ytm
@@ -136,6 +145,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if do_spotify_to_ytm:
         missing = compute_missing(spotify_liked, ytm_liked)
+        vprint(f"Spotify → YTM: {len(missing)} tracks missing in YTM")
         matched, unmatched = resolve_matches(
             missing,
             ytm.search_track,
@@ -148,17 +158,20 @@ def main(argv: Sequence[str] | None = None) -> int:
             cache_read=args.cache_read,
             cache_write=args.cache_write,
             max_workers=args.workers,
+            verbose=args.verbose,
         )
         if args.apply:
             to_like = [match for _, match in matched]
             if args.cache_read:
                 to_like = [track for track in to_like if not cache.is_liked("ytm", track.source_id)]
+            vprint(f"Spotify → YTM: Liking {len(to_like)} tracks on YTM")
             try:
                 ytm.like_tracks(
                     to_like,
                     batch_size=args.batch_size,
                     batch_delay=args.batch_delay,
                     max_workers=args.workers,
+                    verbose=args.verbose,
                 )
             except RuntimeError as exc:
                 print(str(exc), file=sys.stderr)
@@ -175,6 +188,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if do_ytm_to_spotify:
         missing = compute_missing(ytm_liked, spotify_liked)
+        vprint(f"YTM → Spotify: {len(missing)} tracks missing in Spotify")
         matched, unmatched = resolve_matches(
             missing,
             spotify.search_track,
@@ -187,16 +201,19 @@ def main(argv: Sequence[str] | None = None) -> int:
             cache_read=args.cache_read,
             cache_write=args.cache_write,
             max_workers=args.workers,
+            verbose=args.verbose,
         )
         if args.apply:
             to_save = [match for _, match in matched]
             if args.cache_read:
                 to_save = [track for track in to_save if not cache.is_liked("spotify", track.source_id)]
+            vprint(f"YTM → Spotify: Saving {len(to_save)} tracks to Spotify")
             spotify.save_tracks(
                 to_save,
                 batch_size=args.batch_size,
                 batch_delay=args.batch_delay,
                 max_workers=args.workers,
+                verbose=args.verbose,
             )
             if args.cache_write:
                 cache.mark_liked_many("spotify", [track.source_id for track in to_save])

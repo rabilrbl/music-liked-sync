@@ -43,12 +43,21 @@ def resolve_matches(
     cache_read: bool = True,
     cache_write: bool = True,
     max_workers: int = 4,
+    verbose: bool = False,
 ) -> tuple[list[tuple[Track, Track]], list[Track]]:
     matched: list[tuple[Track, Track]] = []
     unmatched: list[Track] = []
     matched_lock = threading.Lock()
 
+    def vprint(*msg):
+        if verbose:
+            with matched_lock:
+                # Clear progress line before printing verbose log
+                print("".ljust(90), end="\r")
+                print(*msg)
+
     candidates_to_process = list(missing if max_add is None else missing[:max_add])
+    vprint(f"Resolving matches for {len(candidates_to_process)} tracks ({label})...")
     chunks = batched(candidates_to_process, batch_size)
 
     def process_track(wanted: Track) -> tuple[Track, Track | None, bool]:
@@ -57,6 +66,7 @@ def resolve_matches(
         if cache and cache_direction and cache_read:
             cached_match = cache.get_match(cache_direction, wanted)
         if cached_match:
+            vprint(f"  [CACHE] {wanted.display} -> {cached_match.display}")
             return wanted, cached_match, False
 
         try:
@@ -68,8 +78,13 @@ def resolve_matches(
             return wanted, None, True, summary  # type: ignore
 
         match = best_match(wanted, candidates)
-        if match and cache and cache_direction and cache_write:
-            cache.store_match(cache_direction, wanted, match)
+        if match:
+            vprint(f"  [MATCH] {wanted.display} -> {match.display}")
+            if cache and cache_direction and cache_write:
+                cache.store_match(cache_direction, wanted, match)
+        else:
+            vprint(f"  [MISS]  {wanted.display} (no match in {len(candidates)} search results)")
+        
         return wanted, match, False
 
     def update_progress():
