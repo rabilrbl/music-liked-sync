@@ -12,7 +12,6 @@ from .utils import (
     best_match,
     normalize_key,
     sleep_between_batches,
-    unique_by_key,
 )
 
 
