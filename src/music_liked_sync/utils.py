@@ -15,14 +15,33 @@ def _ascii_lower(value: str) -> str:
     return value.lower()
 
 
-def normalize_text(value: str) -> str:
+def normalize_text(value: str, artists: Sequence[str] | None = None) -> str:
     text = _ascii_lower(value)
     text = text.replace("&", " and ")
+    
     # Handle common abbreviations
     text = re.sub(r"\bu\b", "you", text)
     text = re.sub(r"\br\b", "are", text)
     text = re.sub(r"\bw/\b", "with", text)
     text = re.sub(r"\bw/o\b", "without", text)
+    
+    # Aggressively strip metadata after common YTM delimiters
+    # e.g., "Song Name | Season 14 | Pasoori" -> "Song Name Pasoori"
+    # Actually, often it's "Coke Studio | Season 14 | Pasoori"
+    text = re.sub(r"\bcoke studio\s*\|\s*season\s*\d+\s*\|\s*", "", text)
+    
+    # If it's "Artist - Song", and "Artist" is in our artists list, strip it
+    if artists:
+        for artist in artists:
+            norm_a = _ascii_lower(artist)
+            # Match "Artist - " or "Artist: " at the start
+            text = re.sub(f"^{re.escape(norm_a)}\\s*[-–—:]\\s*", "", text)
+            # Also handle "Artist | "
+            text = re.sub(f"^{re.escape(norm_a)}\\s*\\|\\s*", "", text)
+
+    # Remove metadata after certain delimiters if they appear near the end or look like noise
+    # | is very common for "Song | Metadata"
+    text = re.sub(r"\s*\|\s*.*$", "", text)
     
     # Remove featuring artist parts from title
     text = re.sub(r"\s+\(?(?:feat|ft|featuring)\.?\s+.*$", "", text)
@@ -49,7 +68,7 @@ def normalize_artist(value: str) -> str:
 
 def normalize_key(title: str, artists: Sequence[str]) -> str:
     artist_part = "+".join(sorted(normalize_artist(a) for a in artists if a))
-    return f"{normalize_text(title)}::{artist_part}"
+    return f"{normalize_text(title, artists)}::{artist_part}"
 
 
 def artist_matches(left: Sequence[str], right: Sequence[str]) -> bool:
@@ -67,7 +86,9 @@ def artist_matches(left: Sequence[str], right: Sequence[str]) -> bool:
 
 
 def track_similarity(wanted: Track, candidate: Track) -> float:
-    title_score = SequenceMatcher(None, normalize_text(wanted.title), normalize_text(candidate.title)).ratio()
+    title_score = SequenceMatcher(
+        None, normalize_text(wanted.title, wanted.artists), normalize_text(candidate.title, candidate.artists)
+    ).ratio()
     artist_score = 1.0 if artist_matches(wanted.artists, candidate.artists) else 0.0
     duration_score = 0.0
     if wanted.duration_ms and candidate.duration_ms:

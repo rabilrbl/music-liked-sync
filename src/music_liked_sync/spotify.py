@@ -292,13 +292,23 @@ def parse_spotify_track(item: dict) -> Track | None:
 def build_spotify_search_queries(wanted: Track) -> list[str]:
     seen: set[str] = set()
     queries: list[str] = []
+    from .utils import normalize_text, normalize_artist
+    
     title = wanted.title.strip()
+    norm_title = normalize_text(title, wanted.artists)
     primary_artist = primary_search_artist(wanted.artists)
+    all_artists = " ".join(normalize_artist(a) for a in wanted.artists if a)
+
     candidates = [
         f"track:{title} artist:{primary_artist}" if title and primary_artist else "",
+        f"track:{norm_title} artist:{primary_artist}" if norm_title and primary_artist else "",
         f"track:{title}" if title else "",
+        f"track:{norm_title}" if norm_title else "",
         f"{title} {primary_artist}".strip(),
+        f"{norm_title} {primary_artist}".strip(),
+        f"{norm_title} {all_artists}".strip(),
         title,
+        norm_title,
     ]
     for candidate in candidates:
         query = truncate_query(candidate)
