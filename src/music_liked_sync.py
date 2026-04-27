@@ -1576,8 +1576,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         "heartbeat_enabled": heartbeat.enabled,
         "heartbeat_interval": args.heartbeat_interval,
         "heartbeat_timeout": args.heartbeat_timeout,
-        "spotify_to_ytm": report["spotify_to_ytm"],
-        "ytm_to_spotify": report["ytm_to_spotify"],
     }, ensure_ascii=False, indent=2))
     return 0
 
