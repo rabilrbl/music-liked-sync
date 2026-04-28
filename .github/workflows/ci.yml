@@ -17,11 +17,23 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: '3.13'
-      - name: Install dependencies
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+      - name: Install Python dependencies
         run: uv sync --all-groups
-      - name: Lint
+      - name: Python Lint
         run: uv run ruff check .
-      - name: Tests
+      - name: Python Tests
         run: uv run pytest -q
-      - name: Compile
-        run: uv run python -m py_compile src/music_liked_sync/*.py
+      - name: Go Format and Vet
+        run: |
+          if [ "$(gofmt -l . | wc -l)" -gt 0 ]; then
+            echo "Go files are not formatted"
+            gofmt -l .
+            exit 1
+          fi
+          go vet ./...
+      - name: Go Tests
+        run: go test -v ./...
+
