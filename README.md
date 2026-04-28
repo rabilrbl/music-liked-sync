@@ -12,20 +12,26 @@ Defaults are safe and session-first:
 - Writes JSON report (`sync-report.json`)
 - Persists sqlite cache (`state/sync-cache.sqlite3`) for matches/liked-state reuse
 
-## Requirements
-
-- Python 3.11+
-- [`uv`](https://docs.astral.sh/uv/)
-- Chromium via Playwright (`uv run playwright install chromium`)
-- Active Spotify and YouTube Music account sessions in browser on first run
-
 ## Install
 
+Download the latest binary for your OS and architecture from the [Releases](https://github.com/rabilrbl/music-liked-sync/releases) page.
+
+Alternatively, if you have Go installed:
+
 ```bash
-git clone https://github.com/rabilrbl/music-liked-sync.git
-cd music-liked-sync
-uv sync --all-groups
-uv run playwright install chromium
+go install github.com/rabilrbl/music-liked-sync/cmd/music-liked-sync@latest
+```
+
+### Playwright Requirements
+
+This tool uses a headless Chromium browser to authenticate. You must install the Playwright dependencies before your first run.
+
+If you installed via a binary release:
+```bash
+# The CLI will prompt you if Playwright drivers are missing, typically requiring:
+npx playwright install chromium
+# Or using the Go package installer directly:
+go run github.com/playwright-community/playwright-go/cmd/playwright@latest install --with-deps chromium
 ```
 
 ## Auth model
@@ -55,46 +61,46 @@ The active YouTube Music browser session is protected by `state/locks/ytmusic-br
 ## Dry-run (default)
 
 ```bash
-uv run music-liked-sync
+music-liked-sync
 ```
 
 ## Apply bidirectional sync
 
 ```bash
-uv run music-liked-sync --apply
+music-liked-sync --apply
 ```
 
 ## Direction-specific
 
 ```bash
 # Spotify -> YouTube Music
-uv run music-liked-sync --spotify-to-ytm --apply
+music-liked-sync --spotify-to-ytm --apply
 
 # YouTube Music -> Spotify
-uv run music-liked-sync --ytm-to-spotify --apply
+music-liked-sync --ytm-to-spotify --apply
 ```
 
 ## Batching and caps
 
 ```bash
 # smaller batches + longer pause
-uv run music-liked-sync --batch-size 25 --batch-delay 2 --apply
+music-liked-sync --batch-size 25 --batch-delay 2 --apply
 
 # optional per-direction cap
-uv run music-liked-sync --max-add 100 --apply
+music-liked-sync --max-add 100 --apply
 ```
 
 ## Cache controls
 
 ```bash
 # custom sqlite path
-uv run music-liked-sync --cache-db state/my-sync.sqlite3
+music-liked-sync --cache-db state/my-sync.sqlite3
 
 # reuse cached library snapshots for 30m
-uv run music-liked-sync --cache-library-ttl 1800
+music-liked-sync --cache-library-ttl 1800
 
 # disable cache read/write
-uv run music-liked-sync --no-cache-read --no-cache-write
+music-liked-sync --no-cache-read --no-cache-write
 ```
 
 ## CLI options
@@ -119,10 +125,10 @@ uv run music-liked-sync --no-cache-read --no-cache-write
 ## Development
 
 ```bash
-uv sync --all-groups
-uv run ruff check .
-uv run pytest -q
-uv run music-liked-sync --help
+go mod tidy
+gofmt -w .
+go test -v ./...
+go build -o music-liked-sync ./cmd/music-liked-sync
 ```
 
 ## License
