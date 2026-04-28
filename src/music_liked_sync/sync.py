@@ -30,18 +30,20 @@ class _Progress:
         sys.stderr.flush()
 
     def status(self, message: str) -> None:
-        """Write an inline status line (overwrites previous)."""
+        """Write an inline status line (overwrites previous), padded to clear stale chars."""
         with self._lock:
-            sys.stderr.write(f"\r{message}")
+            # Pad message to 90 chars to overwrite any previous longer status, then \r to stay on same line
+            padded = message[:90].ljust(90)
+            sys.stderr.write(f"\r{padded}")
             sys.stderr.flush()
 
     def log(self, *msg) -> None:
-        """Write a verbose log line, clearing the progress line first."""
+        """Write a verbose log line to stderr, clearing the progress line first."""
         if not self.verbose:
             return
         with self._lock:
             self.clear()
-            print(*msg)
+            print(*msg, file=sys.stderr)
 
     def finalize(self) -> None:
         """Clear the progress line after work is done."""

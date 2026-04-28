@@ -1,5 +1,6 @@
 import json
 import sqlite3
+import threading
 import time
 from dataclasses import asdict
 from pathlib import Path
@@ -13,6 +14,7 @@ class SyncCache:
     def __init__(self, path: Path) -> None:
         self.path = path
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._lock = threading.Lock()
         self._conn = sqlite3.connect(self.path, check_same_thread=False)
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute(
@@ -72,24 +74,25 @@ class SyncCache:
     def store_match(self, direction: str, source: Track, target: Track) -> None:
         source_key = normalize_key(source.title, source.artists)
         now = time.time()
-        self._conn.execute(
-            """
-            INSERT INTO matches(direction, source_key, source_track_json, target_track_json, updated_at)
-            VALUES (?, ?, ?, ?, ?)
-            ON CONFLICT(direction, source_key) DO UPDATE SET
-                source_track_json=excluded.source_track_json,
-                target_track_json=excluded.target_track_json,
-                updated_at=excluded.updated_at
-            """,
-            (
-                direction,
-                source_key,
-                self._serialize_track(source),
-                self._serialize_track(target),
-                now,
-            ),
-        )
-        self._conn.commit()
+        with self._lock:
+            self._conn.execute(
+                """
+                INSERT INTO matches(direction, source_key, source_track_json, target_track_json, updated_at)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(direction, source_key) DO UPDATE SET
+                    source_track_json=excluded.source_track_json,
+                    target_track_json=excluded.target_track_json,
+                    updated_at=excluded.updated_at
+                """,
+                (
+                    direction,
+                    source_key,
+                    self._serialize_track(source),
+                    self._serialize_track(target),
+                    now,
+                ),
+            )
+            self._conn.commit()
 
     def get_match(self, direction: str, source: Track) -> Track | None:
         source_key = normalize_key(source.title, source.artists)
@@ -112,16 +115,17 @@ class SyncCache:
         rows = [(service, source_id, now) for source_id in sorted(set(source_ids)) if source_id]
         if not rows:
             return
-        self._conn.executemany(
-            """
-            INSERT INTO liked_tracks(service, source_id, updated_at)
-            VALUES (?, ?, ?)
-            ON CONFLICT(service, source_id) DO UPDATE SET
-                updated_at=excluded.updated_at
-            """,
-            rows,
-        )
-        self._conn.commit()
+        with self._lock:
+            self._conn.executemany(
+                """
+                INSERT INTO liked_tracks(service, source_id, updated_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(service, source_id) DO UPDATE SET
+                    updated_at=excluded.updated_at
+                """,
+                rows,
+            )
+            self._conn.commit()
 
     def is_liked(self, service: str, source_id: str) -> bool:
         row = self._conn.execute(
@@ -133,17 +137,18 @@ class SyncCache:
     def store_library(self, service: str, tracks: Sequence[Track]) -> None:
         payload = json.dumps([asdict(track) for track in tracks], ensure_ascii=False)
         now = time.time()
-        self._conn.execute(
-            """
-            INSERT INTO library_cache(service, tracks_json, fetched_at)
-            VALUES (?, ?, ?)
-            ON CONFLICT(service) DO UPDATE SET
-                tracks_json=excluded.tracks_json,
-                fetched_at=excluded.fetched_at
-            """,
-            (service, payload, now),
-        )
-        self._conn.commit()
+        with self._lock:
+            self._conn.execute(
+                """
+                INSERT INTO library_cache(service, tracks_json, fetched_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(service) DO UPDATE SET
+                    tracks_json=excluded.tracks_json,
+                    fetched_at=excluded.fetched_at
+                """,
+                (service, payload, now),
+            )
+            self._conn.commit()
 
     def get_library(self, service: str, max_age_seconds: float) -> list[Track] | None:
         if max_age_seconds <= 0:
