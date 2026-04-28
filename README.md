@@ -50,7 +50,7 @@ The active Spotify browser session is protected by `state/locks/spotify-web-sess
 
 First run opens `https://music.youtube.com` in Chromium. Log in once.
 A persistent browser profile is stored at `auth/ytmusic-browser-session/`.
-Future runs build fresh ytmusicapi browser headers directly from that live session; nothing is written to `auth/browser.json`.
+Future runs build fresh InnerTube API headers directly from that live session.
 
 The active YouTube Music browser session is protected by `state/locks/ytmusic-browser-session.lock`.
 
