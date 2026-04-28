@@ -24,7 +24,7 @@ go install github.com/rabilrbl/music-liked-sync/cmd/music-liked-sync@latest
 
 ### Playwright Requirements
 
-This tool uses a headless Chromium browser to authenticate. You must install the Playwright dependencies before your first run.
+This tool uses Chromium browser sessions to authenticate. You must install the Playwright dependencies before your first run.
 
 If you installed via a binary release:
 ```bash

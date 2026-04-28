@@ -27,9 +27,6 @@ type Options struct {
 	SpotifyToYTM    bool
 	YTMToSpotify    bool
 	ReportFile      string
-	Workers         int
-	Verbose         bool
-	Headless        bool
 }
 
 func NewRootCommand() *cobra.Command {
@@ -55,19 +52,12 @@ func NewRootCommand() *cobra.Command {
 	cmd.Flags().BoolVar(&opts.SpotifyToYTM, "spotify-to-ytm", false, "only sync Spotify to YTM")
 	cmd.Flags().BoolVar(&opts.YTMToSpotify, "ytm-to-spotify", false, "only sync YTM to Spotify")
 	cmd.Flags().StringVar(&opts.ReportFile, "report", "sync-report.json", "report file path")
-	cmd.Flags().IntVar(&opts.Workers, "workers", 4, "number of workers")
-	cmd.Flags().BoolVar(&opts.Verbose, "verbose", false, "verbose output")
-	cmd.Flags().BoolVar(&opts.Headless, "headless", false, "run browser in headless mode")
 
 	return cmd
 }
 
 func Run(opts Options, cmd *cobra.Command) error {
-	vprint := func(format string, a ...interface{}) {
-		if opts.Verbose {
-			fmt.Printf(format+"\n", a...)
-		}
-	}
+	vprint := func(format string, a ...interface{}) {}
 
 	// Ensure absolute paths
 	absPath := func(p string) string {
@@ -82,12 +72,12 @@ func Run(opts Options, cmd *cobra.Command) error {
 	spotifySessionDir := absPath(spotify.DefaultSpotifyWebSessionDir)
 	cachePath := absPath(opts.CacheDB)
 
-	ytAuth, err := ytmusic.EnsureYTBrowserAuth(ytSessionDir, absPath(ytmusic.DefaultYTBrowserLockFile), opts.Headless, ytmusic.DefaultYTBrowserLoginTimeout)
+	ytAuth, err := ytmusic.EnsureYTBrowserAuth(ytSessionDir, absPath(ytmusic.DefaultYTBrowserLockFile), false, ytmusic.DefaultYTBrowserLoginTimeout)
 	if err != nil {
 		return err
 	}
 
-	spotifyBackend, err := spotify.NewSpotifyBackend(opts.Market, spotifySessionDir, absPath(spotify.DefaultSpotifyWebLockFile), opts.Headless, spotify.DefaultSpotifyWebLoginTimeout)
+	spotifyBackend, err := spotify.NewSpotifyBackend(opts.Market, spotifySessionDir, absPath(spotify.DefaultSpotifyWebLockFile), false, spotify.DefaultSpotifyWebLoginTimeout)
 	if err != nil {
 		return err
 	}
@@ -105,7 +95,7 @@ func Run(opts Options, cmd *cobra.Command) error {
 		spotifyLiked, _ = c.GetLibrary("spotify", opts.CacheLibraryTTL)
 	}
 	if spotifyLiked == nil {
-		spotifyLiked, err = spotifyBackend.LikedTracks(opts.Verbose)
+		spotifyLiked, err = spotifyBackend.LikedTracks(false)
 		if err != nil {
 			return err
 		}
@@ -121,7 +111,7 @@ func Run(opts Options, cmd *cobra.Command) error {
 		ytmLiked, _ = c.GetLibrary("ytm", opts.CacheLibraryTTL)
 	}
 	if ytmLiked == nil {
-		ytmLiked, err = ytm.LikedTracks(opts.Verbose)
+		ytmLiked, err = ytm.LikedTracks(false)
 		if err != nil {
 			return err
 		}
@@ -146,7 +136,7 @@ func Run(opts Options, cmd *cobra.Command) error {
 	}
 
 	if doSpotifyToYTM {
-		missing := sync.ComputeMissing(spotifyLiked, ytmLiked, opts.Verbose)
+		missing := sync.ComputeMissing(spotifyLiked, ytmLiked, false)
 		vprint("Spotify → YTM: %d tracks missing in YTM", len(missing))
 		matched, unmatched, err := sync.ResolveMatches(
 			missing,
@@ -159,7 +149,7 @@ func Run(opts Options, cmd *cobra.Command) error {
 			"spotify_to_ytm",
 			!opts.NoCacheRead,
 			!opts.NoCacheWrite,
-			opts.Verbose,
+			false,
 		)
 		if err != nil {
 			return err
@@ -177,7 +167,7 @@ func Run(opts Options, cmd *cobra.Command) error {
 				}
 			}
 			vprint("Spotify → YTM: Liking %d tracks on YTM", len(toLike))
-			if err := ytm.LikeTracks(toLike, opts.BatchSize, opts.BatchDelay, opts.Verbose); err != nil {
+			if err := ytm.LikeTracks(toLike, opts.BatchSize, opts.BatchDelay, false); err != nil {
 				return err
 			}
 			if !opts.NoCacheWrite {
@@ -197,7 +187,7 @@ func Run(opts Options, cmd *cobra.Command) error {
 	}
 
 	if doYTMToSpotify {
-		missing := sync.ComputeMissing(ytmLiked, spotifyLiked, opts.Verbose)
+		missing := sync.ComputeMissing(ytmLiked, spotifyLiked, false)
 		vprint("YTM → Spotify: %d tracks missing in Spotify", len(missing))
 		matched, unmatched, err := sync.ResolveMatches(
 			missing,
@@ -210,7 +200,7 @@ func Run(opts Options, cmd *cobra.Command) error {
 			"ytm_to_spotify",
 			!opts.NoCacheRead,
 			!opts.NoCacheWrite,
-			opts.Verbose,
+			false,
 		)
 		if err != nil {
 			return err
@@ -228,7 +218,7 @@ func Run(opts Options, cmd *cobra.Command) error {
 				}
 			}
 			vprint("YTM → Spotify: Saving %d tracks to Spotify", len(toSave))
-			if err := spotifyBackend.SaveTracks(toSave, opts.BatchSize, opts.BatchDelay, opts.Verbose); err != nil {
+			if err := spotifyBackend.SaveTracks(toSave, opts.BatchSize, opts.BatchDelay, false); err != nil {
 				return err
 			}
 			if !opts.NoCacheWrite {
