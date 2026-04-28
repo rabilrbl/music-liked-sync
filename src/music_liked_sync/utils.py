@@ -151,6 +151,30 @@ def sleep_between_batches(
         sleep_fn(batch_delay)
 
 
+def cookie_value(cookie_header: str, name: str) -> str | None:
+    """Extract a named cookie value from a cookie header string."""
+    from http.cookies import SimpleCookie
+
+    cookie = SimpleCookie()
+    try:
+        cookie.load(cookie_header.replace('"', ""))
+    except Exception:
+        return None
+    morsel = cookie.get(name)
+    return morsel.value if morsel else None
+
+
+def playwright_cookie_header(cookies: Sequence[dict]) -> str:
+    """Build a cookie header string from Playwright cookie dicts."""
+    pairs = []
+    for cookie in sorted(cookies, key=lambda item: (str(item.get("name", "")), str(item.get("domain", "")))):
+        name = str(cookie.get("name", "")).strip()
+        value = str(cookie.get("value", ""))
+        if name:
+            pairs.append(f"{name}={value}")
+    return "; ".join(pairs)
+
+
 def read_json_object(path: Path) -> dict:
     try:
         data = json.loads(path.read_text(encoding="utf-8"))

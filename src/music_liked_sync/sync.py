@@ -6,7 +6,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 from .cache import SyncCache
 from .constants import DEFAULT_BATCH_DELAY, DEFAULT_BATCH_SIZE
-from .models import Track
+from .models import SearchResult, Track
 from .utils import (
     batched,
     best_match,
@@ -14,6 +14,39 @@ from .utils import (
     normalize_key,
     sleep_between_batches,
 )
+
+
+class _Progress:
+    """Thread-safe progress reporter that uses stderr for status lines."""
+
+    def __init__(self, label: str, verbose: bool = False) -> None:
+        self.label = label
+        self.verbose = verbose
+        self._lock = threading.Lock()
+
+    def clear(self) -> None:
+        """Clear the current progress line."""
+        sys.stderr.write("\r" + " " * 90 + "\r")
+        sys.stderr.flush()
+
+    def status(self, message: str) -> None:
+        """Write an inline status line (overwrites previous)."""
+        with self._lock:
+            sys.stderr.write(f"\r{message}")
+            sys.stderr.flush()
+
+    def log(self, *msg) -> None:
+        """Write a verbose log line, clearing the progress line first."""
+        if not self.verbose:
+            return
+        with self._lock:
+            self.clear()
+            print(*msg)
+
+    def finalize(self) -> None:
+        """Clear the progress line after work is done."""
+        with self._lock:
+            self.clear()
 
 
 def compute_missing(left: Sequence[Track], right: Sequence[Track], verbose: bool = False) -> list[Track]:
@@ -27,10 +60,11 @@ def compute_missing(left: Sequence[Track], right: Sequence[Track], verbose: bool
             if norm_a:
                 right_by_artist.setdefault(norm_a, []).append(track)
 
+    progress = _Progress("compute_missing", verbose)
     missing = []
     for i, track in enumerate(left):
         if verbose and i % 100 == 0 and i > 0:
-            print(f"  Comparing track {i}/{len(left)}...", end="\r", flush=True)
+            progress.status(f"  Comparing track {i}/{len(left)}...")
 
         key = normalize_key(track.title, track.artists)
         if key in right_keys:
@@ -52,7 +86,7 @@ def compute_missing(left: Sequence[Track], right: Sequence[Track], verbose: bool
         missing.append(track)
 
     if verbose:
-        print("".ljust(90), end="\r")
+        progress.finalize()
     return missing
 
 
@@ -75,26 +109,20 @@ def resolve_matches(
     matched: list[tuple[Track, Track]] = []
     unmatched: list[Track] = []
     matched_lock = threading.Lock()
-
-    def vprint(*msg):
-        if verbose:
-            with matched_lock:
-                # Clear progress line before printing verbose log
-                print("".ljust(90), end="\r")
-                print(*msg)
+    progress = _Progress(label, verbose)
 
     candidates_to_process = list(missing if max_add is None else missing[:max_add])
-    vprint(f"Resolving matches for {len(candidates_to_process)} tracks ({label})...")
+    progress.log(f"Resolving matches for {len(candidates_to_process)} tracks ({label})...")
     chunks = batched(candidates_to_process, batch_size)
 
-    def process_track(wanted: Track) -> tuple[Track, Track | None, bool]:
-        """Returns (wanted, match, failed_search)"""
+    def process_track(wanted: Track) -> SearchResult:
+        """Search for a track match, using cache if available."""
         cached_match = None
         if cache and cache_direction and cache_read:
             cached_match = cache.get_match(cache_direction, wanted)
         if cached_match:
-            vprint(f"  [CACHE] {wanted.display} -> {cached_match.display}")
-            return wanted, cached_match, False
+            progress.log(f"  [CACHE] {wanted.display} -> {cached_match.display}")
+            return SearchResult(wanted=wanted, match=cached_match, search_failed=False)
 
         try:
             candidates = search_fn(wanted)
@@ -102,21 +130,17 @@ def resolve_matches(
             raise
         except Exception as exc:
             summary = str(exc).strip().splitlines()[0][:180] if str(exc).strip() else exc.__class__.__name__
-            return wanted, None, True, summary  # type: ignore
+            return SearchResult(wanted=wanted, match=None, search_failed=True, error_summary=summary)
 
         match = best_match(wanted, candidates)
         if match:
-            vprint(f"  [MATCH] {wanted.display} -> {match.display}")
+            progress.log(f"  [MATCH] {wanted.display} -> {match.display}")
             if cache and cache_direction and cache_write:
                 cache.store_match(cache_direction, wanted, match)
         else:
-            vprint(f"  [MISS]  {wanted.display} (no match in {len(candidates)} search results)")
+            progress.log(f"  [MISS]  {wanted.display} (no match in {len(candidates)} search results)")
         
-        return wanted, match, False
-
-    def update_progress():
-        with matched_lock:
-            print(f"{label}: {len(matched)} matched, {len(unmatched)} unmatched", end="\r", flush=True)
+        return SearchResult(wanted=wanted, match=match, search_failed=False)
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         for batch_index, chunk in enumerate(chunks):
@@ -124,19 +148,18 @@ def resolve_matches(
             for future in futures:
                 try:
                     res = future.result()
-                    if len(res) == 4:  # Failure case
-                        wanted, _, _, summary = res
-                        print(f"\n{label}: search failed for {wanted.display}; treating as unresolved ({summary})", file=sys.stderr)
+                    if res.search_failed:
+                        print(f"\n{label}: search failed for {res.wanted.display}; treating as unresolved ({res.error_summary})", file=sys.stderr)
                         with matched_lock:
-                            unmatched.append(wanted)
+                            unmatched.append(res.wanted)
                     else:
-                        wanted, match, _ = res
                         with matched_lock:
-                            if match:
-                                matched.append((wanted, match))
+                            if res.match:
+                                matched.append((res.wanted, res.match))
                             else:
-                                unmatched.append(wanted)
-                    update_progress()
+                                unmatched.append(res.wanted)
+                    with matched_lock:
+                        progress.status(f"{label}: {len(matched)} matched, {len(unmatched)} unmatched")
                 except RuntimeError:
                     # Cancel pending futures and re-raise
                     for f in futures:
@@ -145,5 +168,5 @@ def resolve_matches(
 
             sleep_between_batches(batch_index, len(chunks), batch_delay, sleep_fn)
 
-    print("".ljust(90), end="\r")
+    progress.finalize()
     return matched, unmatched

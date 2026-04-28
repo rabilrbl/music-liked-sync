@@ -27,6 +27,8 @@ from .constants import (
 from .models import SpotifyWebSessionState, Track
 from .utils import (
     batched,
+    cookie_value,
+    playwright_cookie_header,
     primary_search_artist,
     sleep_between_batches,
     truncate_query,
@@ -50,14 +52,7 @@ def browser_session_lock(lock_path: Path):
             lock_file.close()
 
 
-def _playwright_cookie_header(cookies: Sequence[dict]) -> str:
-    pairs = []
-    for cookie in sorted(cookies, key=lambda item: (str(item.get("name", "")), str(item.get("domain", "")))):
-        name = str(cookie.get("name", "")).strip()
-        value = str(cookie.get("value", ""))
-        if name:
-            pairs.append(f"{name}={value}")
-    return "; ".join(pairs)
+
 
 
 def _safe_page_user_agent(page, default: str = DEFAULT_BROWSER_USER_AGENT) -> str:
@@ -68,15 +63,7 @@ def _safe_page_user_agent(page, default: str = DEFAULT_BROWSER_USER_AGENT) -> st
     return str(value or default)
 
 
-def _cookie_value(cookie_header: str, name: str) -> str | None:
-    from http.cookies import SimpleCookie
-    cookie = SimpleCookie()
-    try:
-        cookie.load(cookie_header.replace('"', ""))
-    except Exception:
-        return None
-    morsel = cookie.get(name)
-    return morsel.value if morsel else None
+
 
 
 def spotify_web_token_from_payload(data: dict) -> str:
@@ -161,9 +148,9 @@ def ensure_spotify_web_session_state_from_session(
                 try:
                     page = context.pages[0] if context.pages else context.new_page()
                     user_agent = _safe_page_user_agent(page)
-                    cookie_header = _playwright_cookie_header(context.cookies([SPOTIFY_WEB_ORIGIN]))
+                    cookie_header = playwright_cookie_header(context.cookies([SPOTIFY_WEB_ORIGIN]))
 
-                    if not _cookie_value(cookie_header, SPOTIFY_WEB_REQUIRED_COOKIE):
+                    if not cookie_value(cookie_header, SPOTIFY_WEB_REQUIRED_COOKIE):
                         page.goto(SPOTIFY_WEB_ORIGIN, wait_until="domcontentloaded", timeout=60_000)
                         user_agent = _safe_page_user_agent(page)
                         print(
@@ -171,12 +158,12 @@ def ensure_spotify_web_session_state_from_session(
                             "this browser profile will be reused on future runs.",
                             file=sys.stderr,
                         )
-                    while not _cookie_value(cookie_header, SPOTIFY_WEB_REQUIRED_COOKIE) and time.time() < deadline:
+                    while not cookie_value(cookie_header, SPOTIFY_WEB_REQUIRED_COOKIE) and time.time() < deadline:
                         page.wait_for_timeout(2_000)
-                        cookie_header = _playwright_cookie_header(context.cookies([SPOTIFY_WEB_ORIGIN]))
+                        cookie_header = playwright_cookie_header(context.cookies([SPOTIFY_WEB_ORIGIN]))
                         user_agent = _safe_page_user_agent(page)
 
-                    if not _cookie_value(cookie_header, SPOTIFY_WEB_REQUIRED_COOKIE):
+                    if not cookie_value(cookie_header, SPOTIFY_WEB_REQUIRED_COOKIE):
                         raise RuntimeError(
                             f"Spotify Web Player session is not logged in; missing {SPOTIFY_WEB_REQUIRED_COOKIE}. "
                             "Complete Spotify login in the opened browser window, then rerun."
@@ -236,7 +223,17 @@ def spotify_pathfinder_request_json(payload: dict, *, state: SpotifyWebSessionSt
         ) from exc
     parsed = json.loads(raw.decode("utf-8")) if raw else {}
     if isinstance(parsed, dict) and parsed.get("errors"):
-        raise SpotifyAPIError(f"Spotify Web Player pathfinder returned errors: {parsed.get('errors')}")
+        error_data = parsed["errors"]
+        error_message = str(error_data)
+        # Detect stale persisted query hashes — Spotify rotates these periodically
+        if "persisted query" in error_message.lower() or "hash" in error_message.lower():
+            raise SpotifyAPIError(
+                f"Spotify API persisted query hash appears stale or invalid. "
+                f"This typically means Spotify updated their API and the hardcoded SHA256 hashes "
+                f"need updating. Error detail: {error_message}. "
+                f"Please file an issue at https://github.com/rabilrbl/music-liked-sync/issues"
+            )
+        raise SpotifyAPIError(f"Spotify Web Player pathfinder returned errors: {error_data}")
     return parsed
 
 

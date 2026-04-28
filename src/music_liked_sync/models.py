@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import NamedTuple
 
 
 @dataclass(frozen=True)
@@ -23,3 +24,11 @@ class SpotifyWebSessionState:
     user_agent: str
     client_token: str | None = None
     app_version: str | None = None
+
+
+class SearchResult(NamedTuple):
+    """Result of searching for a track match."""
+    wanted: Track
+    match: Track | None
+    search_failed: bool
+    error_summary: str = ""
