@@ -1,16 +1,18 @@
-package music_liked_sync
+package sync
 
 import (
 	"testing"
+
+	"github.com/rabilrbl/music-liked-sync/internal/model"
 )
 
 func TestComputeMissing(t *testing.T) {
-	t1 := Track{Title: "You And Me", Artists: []string{"Artist"}, SourceID: "s1"}
-	t2 := Track{Title: "U and Me", Artists: []string{"Artist"}, SourceID: "s2"}
-	t3 := Track{Title: "Different", Artists: []string{"Artist"}, SourceID: "s3"}
+	t1 := model.Track{Title: "You And Me", Artists: []string{"Artist"}, SourceID: "s1"}
+	t2 := model.Track{Title: "U and Me", Artists: []string{"Artist"}, SourceID: "s2"}
+	t3 := model.Track{Title: "Different", Artists: []string{"Artist"}, SourceID: "s3"}
 
 	// If t1 is in 'right', t2 should also be considered matched due to fuzzy matching
-	missing := ComputeMissing([]Track{t1, t2, t3}, []Track{t1}, false)
+	missing := ComputeMissing([]model.Track{t1, t2, t3}, []model.Track{t1}, false)
 	if len(missing) != 1 {
 		t.Errorf("Expected 1 missing track, got %d", len(missing))
 	} else if missing[0].SourceID != "s3" {
@@ -18,19 +20,19 @@ func TestComputeMissing(t *testing.T) {
 	}
 
 	// Exact match check
-	missing2 := ComputeMissing([]Track{t1}, []Track{t1}, false)
+	missing2 := ComputeMissing([]model.Track{t1}, []model.Track{t1}, false)
 	if len(missing2) != 0 {
 		t.Errorf("Expected 0 missing tracks, got %d", len(missing2))
 	}
 }
 
 func TestResolveMatches(t *testing.T) {
-	wanted := []Track{
+	wanted := []model.Track{
 		{Title: "Believer", Artists: []string{"Imagine Dragons"}, SourceID: "spotify:track:1"},
 	}
 
-	searchFn := func(Track) ([]Track, error) {
-		return []Track{{Title: "Believer", Artists: []string{"Imagine Dragons"}, SourceID: "yt1"}}, nil
+	searchFn := func(model.Track) ([]model.Track, error) {
+		return []model.Track{{Title: "Believer", Artists: []string{"Imagine Dragons"}, SourceID: "yt1"}}, nil
 	}
 
 	matched, unmatched, err := ResolveMatches(wanted, searchFn, nil, "test", 50, 0, nil, "", false, false, false)

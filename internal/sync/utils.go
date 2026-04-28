@@ -1,4 +1,4 @@
-package music_liked_sync
+package sync
 
 import (
 	"fmt"
@@ -8,11 +8,15 @@ import (
 	"strings"
 	"unicode"
 
+	"github.com/rabilrbl/music-liked-sync/internal/model"
 	"github.com/xrash/smetrics"
 	"golang.org/x/text/runes"
 	"golang.org/x/text/transform"
 	"golang.org/x/text/unicode/norm"
 )
+
+var CommonTitleSuffixRE = regexp.MustCompile(`(?i)\s*(?:[-–—:]\s*)?\(?\b(?:remaster(?:ed)?(?:\s*\d{2,4})?|\d{4}\s*remaster(?:ed)?|deluxe(?:\s+edition)?|expanded(?:\s+edition)?|explicit|clean|single version|album version|radio edit|edit|live|mono|stereo|from .*|official audio|official video|official music video|official lyric video|lyric video|lyrics|audio only|video only|music video|full video|music audio|high quality|hq|hd|topic|original motion picture soundtrack|soundtrack|ost)\b\)?\s*$`)
+var ArtistSplitRE = regexp.MustCompile(`(?i)\s*(?:,|/|&| x | and | feat\.? | ft\.? | featuring )\s*`)
 
 func asciiLower(s string) string {
 	t := transform.Chain(norm.NFD, runes.Remove(runes.In(unicode.Mn)), norm.NFC)
@@ -102,7 +106,7 @@ func ArtistMatches(left, right []string) bool {
 	return false
 }
 
-func TrackSimilarity(wanted, candidate Track) float64 {
+func TrackSimilarity(wanted, candidate model.Track) float64 {
 	titleScore := smetrics.JaroWinkler(
 		NormalizeText(wanted.Title, wanted.Artists),
 		NormalizeText(candidate.Title, candidate.Artists),
@@ -120,7 +124,7 @@ func TrackSimilarity(wanted, candidate Track) float64 {
 	return (titleScore * 0.62) + (artistScore * 0.33) + (durationScore * 0.05)
 }
 
-func BestMatch(wanted Track, candidates []Track, threshold float64) *Track {
+func BestMatch(wanted model.Track, candidates []model.Track, threshold float64) *model.Track {
 	if len(candidates) == 0 {
 		return nil
 	}
@@ -133,7 +137,7 @@ func BestMatch(wanted Track, candidates []Track, threshold float64) *Track {
 
 	type scoredTrack struct {
 		score float64
-		track Track
+		track model.Track
 	}
 	scored := make([]scoredTrack, len(candidates))
 	for i, c := range candidates {
@@ -177,19 +181,4 @@ func TruncateQuery(query string, limit int) string {
 		return query[:limit]
 	}
 	return truncated
-}
-
-func Batched(items []interface{}, batchSize int) [][]interface{} {
-	if batchSize < 1 {
-		return nil
-	}
-	var batches [][]interface{}
-	for i := 0; i < len(items); i += batchSize {
-		end := i + batchSize
-		if end > len(items) {
-			end = len(items)
-		}
-		batches = append(batches, items[i:end])
-	}
-	return batches
 }

@@ -1,4 +1,4 @@
-package music_liked_sync
+package spotify
 
 import (
 	"encoding/json"
@@ -12,7 +12,26 @@ import (
 	"github.com/go-resty/resty/v2"
 	"github.com/gofrs/flock"
 	"github.com/playwright-community/playwright-go"
+	"github.com/rabilrbl/music-liked-sync/internal/model"
+	mls_sync "github.com/rabilrbl/music-liked-sync/internal/sync"
 )
+
+const (
+	SpotifyWebOrigin              = "https://open.spotify.com"
+	SpotifyWebTokenURLPrefix      = "https://open.spotify.com/api/token"
+	SpotifyWebPathfinderURL       = "https://api-partner.spotify.com/pathfinder/v2/query"
+	SpotifyWebRequiredCookie      = "sp_dc"
+	DefaultSpotifyWebSessionDir   = "auth/spotify-web-session"
+	DefaultSpotifyWebLockFile     = "state/locks/spotify-web-session.lock"
+	DefaultSpotifyWebLoginTimeout = 300.0
+)
+
+type SpotifyWebSessionState struct {
+	AccessToken string  `json:"access_token"`
+	UserAgent   string  `json:"user_agent"`
+	ClientToken *string `json:"client_token"`
+	AppVersion  *string `json:"app_version"`
+}
 
 type SpotifyWebClient struct {
 	tokenProvider func() (*SpotifyWebSessionState, error)
@@ -291,20 +310,20 @@ func EnsureSpotifyWebSessionState(sessionDir, lockFile string, headless bool, ti
 		return nil, fmt.Errorf("Spotify Web Player returned an anonymous token; complete Spotify login, then rerun")
 	}
 
-	userAgent, _ := page.Evaluate("navigator.userAgent")
+	userAgentVal, _ := page.Evaluate("navigator.userAgent")
 
 	stateMu.Lock()
 	if state == nil {
 		state = &SpotifyWebSessionState{}
 	}
 	state.AccessToken = accessToken
-	state.UserAgent = userAgent.(string)
+	state.UserAgent = userAgentVal.(string)
 	stateMu.Unlock()
 
 	return state, nil
 }
 
-func (b *SpotifyBackend) LikedTracks(verbose bool) ([]Track, error) {
+func (b *SpotifyBackend) LikedTracks(verbose bool) ([]model.Track, error) {
 	if verbose {
 		fmt.Println("Fetching Spotify liked tracks library...")
 	}
@@ -325,7 +344,7 @@ func (b *SpotifyBackend) LikedTracks(verbose bool) ([]Track, error) {
 	}
 
 	items := tracksData["items"].([]interface{})
-	tracks := make([]Track, 0, total)
+	tracks := make([]model.Track, 0, total)
 	for _, item := range items {
 		if t := parseSpotifyTrack(item.(map[string]interface{})); t != nil {
 			tracks = append(tracks, *t)
@@ -355,7 +374,7 @@ func (b *SpotifyBackend) LikedTracks(verbose bool) ([]Track, error) {
 	return tracks, nil
 }
 
-func parseSpotifyTrack(item map[string]interface{}) *Track {
+func parseSpotifyTrack(item map[string]interface{}) *model.Track {
 	trackData, ok := item["track"].(map[string]interface{})
 	if !ok {
 		trackData = item
@@ -429,7 +448,7 @@ func parseSpotifyTrack(item map[string]interface{}) *Track {
 		}
 	}
 
-	return &Track{
+	return &model.Track{
 		Title:      name,
 		Artists:    artists,
 		SourceID:   "spotify:track:" + id,
@@ -438,7 +457,7 @@ func parseSpotifyTrack(item map[string]interface{}) *Track {
 	}
 }
 
-func (b *SpotifyBackend) SearchTrack(wanted Track, limit int) ([]Track, error) {
+func (b *SpotifyBackend) SearchTrack(wanted model.Track, limit int) ([]model.Track, error) {
 	queries := BuildSpotifySearchQueries(wanted)
 	for _, query := range queries {
 		page, err := b.client.Search(query, limit)
@@ -446,7 +465,7 @@ func (b *SpotifyBackend) SearchTrack(wanted Track, limit int) ([]Track, error) {
 			continue
 		}
 		// GraphQL search results extraction is a bit deep
-		var tracks []Track
+		var tracks []model.Track
 		collectTracks(page, &tracks)
 		if len(tracks) > 0 {
 			return tracks, nil
@@ -455,7 +474,7 @@ func (b *SpotifyBackend) SearchTrack(wanted Track, limit int) ([]Track, error) {
 	return nil, nil
 }
 
-func collectTracks(v interface{}, tracks *[]Track) {
+func collectTracks(v interface{}, tracks *[]model.Track) {
 	switch val := v.(type) {
 	case map[string]interface{}:
 		if val["__typename"] == "TrackResponseWrapper" || val["__typename"] == "Track" {
@@ -474,16 +493,16 @@ func collectTracks(v interface{}, tracks *[]Track) {
 	}
 }
 
-func BuildSpotifySearchQueries(wanted Track) []string {
+func BuildSpotifySearchQueries(wanted model.Track) []string {
 	seen := make(map[string]bool)
 	var queries []string
 
 	title := strings.TrimSpace(wanted.Title)
-	normTitle := NormalizeText(title, wanted.Artists)
-	primaryArtist := PrimarySearchArtist(wanted.Artists)
+	normTitle := mls_sync.NormalizeText(title, wanted.Artists)
+	primaryArtist := mls_sync.PrimarySearchArtist(wanted.Artists)
 	var allArtists []string
 	for _, a := range wanted.Artists {
-		allArtists = append(allArtists, NormalizeArtist(a))
+		allArtists = append(allArtists, mls_sync.NormalizeArtist(a))
 	}
 	allArtistsStr := strings.Join(allArtists, " ")
 
@@ -500,7 +519,7 @@ func BuildSpotifySearchQueries(wanted Track) []string {
 	}
 
 	for _, c := range candidates {
-		query := TruncateQuery(c, 240)
+		query := mls_sync.TruncateQuery(c, 240)
 		if query != "" && !seen[query] {
 			seen[query] = true
 			queries = append(queries, query)
@@ -509,7 +528,7 @@ func BuildSpotifySearchQueries(wanted Track) []string {
 	return queries
 }
 
-func (b *SpotifyBackend) SaveTracks(tracks []Track, batchSize int, batchDelay float64, verbose bool) error {
+func (b *SpotifyBackend) SaveTracks(tracks []model.Track, batchSize int, batchDelay float64, verbose bool) error {
 	if verbose {
 		fmt.Printf("Saving %d tracks to Spotify...\n", len(tracks))
 	}

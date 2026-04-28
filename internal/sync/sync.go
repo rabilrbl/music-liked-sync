@@ -1,19 +1,26 @@
-package music_liked_sync
+package sync
 
 import (
 	"fmt"
 	"os"
 	"strings"
 	"time"
+
+	"github.com/rabilrbl/music-liked-sync/internal/model"
 )
 
-func ComputeMissing(left, right []Track, verbose bool) []Track {
+type MatchStore interface {
+	GetMatch(direction string, source model.Track) (*model.Track, error)
+	StoreMatch(direction string, source, target model.Track) error
+}
+
+func ComputeMissing(left, right []model.Track, verbose bool) []model.Track {
 	rightKeys := make(map[string]bool)
 	for _, t := range right {
 		rightKeys[NormalizeKey(t.Title, t.Artists)] = true
 	}
 
-	rightByArtist := make(map[string][]Track)
+	rightByArtist := make(map[string][]model.Track)
 	for _, t := range right {
 		for _, a := range t.Artists {
 			normA := NormalizeArtist(a)
@@ -23,7 +30,7 @@ func ComputeMissing(left, right []Track, verbose bool) []Track {
 		}
 	}
 
-	var missing []Track
+	var missing []model.Track
 	for i, t := range left {
 		if verbose && i%100 == 0 && i > 0 {
 			fmt.Printf("  Comparing track %d/%d...\r", i, len(left))
@@ -34,7 +41,7 @@ func ComputeMissing(left, right []Track, verbose bool) []Track {
 			continue
 		}
 
-		var possibleCandidates []Track
+		var possibleCandidates []model.Track
 		seenIDs := make(map[string]bool)
 		for _, a := range t.Artists {
 			normA := NormalizeArtist(a)
@@ -59,26 +66,21 @@ func ComputeMissing(left, right []Track, verbose bool) []Track {
 	return missing
 }
 
-type MatchResult struct {
-	Source Track
-	Target Track
-}
-
 func ResolveMatches(
-	missing []Track,
-	searchFn func(Track) ([]Track, error),
+	missing []model.Track,
+	searchFn func(model.Track) ([]model.Track, error),
 	maxAdd *int,
 	label string,
 	batchSize int,
 	batchDelay float64,
-	cache *SyncCache,
+	cache MatchStore,
 	cacheDirection string,
 	cacheRead bool,
 	cacheWrite bool,
 	verbose bool,
-) ([]MatchResult, []Track, error) {
-	var matched []MatchResult
-	var unmatched []Track
+) ([]model.MatchedTrack, []model.Track, error) {
+	var matched []model.MatchedTrack
+	var unmatched []model.Track
 
 	candidates := missing
 	if maxAdd != nil && *maxAdd < len(missing) {
@@ -96,7 +98,7 @@ func ResolveMatches(
 				if verbose {
 					fmt.Printf("  [CACHE] %s -> %s\n", wanted.Display(), cached.Display())
 				}
-				matched = append(matched, MatchResult{Source: wanted, Target: *cached})
+				matched = append(matched, model.MatchedTrack{Source: wanted, Target: *cached, Score: 1.0})
 				continue
 			}
 		}
@@ -110,10 +112,11 @@ func ResolveMatches(
 
 		match := BestMatch(wanted, searchRes, 0.82)
 		if match != nil {
+			score := TrackSimilarity(wanted, *match)
 			if verbose {
-				fmt.Printf("  [MATCH] %s -> %s\n", wanted.Display(), match.Display())
+				fmt.Printf("  [MATCH] %s -> %s (score: %.2f)\n", wanted.Display(), match.Display(), score)
 			}
-			matched = append(matched, MatchResult{Source: wanted, Target: *match})
+			matched = append(matched, model.MatchedTrack{Source: wanted, Target: *match, Score: score})
 			if cache != nil && cacheDirection != "" && cacheWrite {
 				cache.StoreMatch(cacheDirection, wanted, *match)
 			}

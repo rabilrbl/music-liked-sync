@@ -1,7 +1,9 @@
-package music_liked_sync
+package model
 
-import "fmt"
-import "strings"
+import (
+	"fmt"
+	"strings"
+)
 
 type Track struct {
 	Title      string   `json:"title"`
@@ -19,9 +21,8 @@ func (t Track) Display() string {
 	return fmt.Sprintf("%s — %s", t.Title, artist)
 }
 
-type SpotifyWebSessionState struct {
-	AccessToken string  `json:"access_token"`
-	UserAgent   string  `json:"user_agent"`
-	ClientToken *string `json:"client_token"`
-	AppVersion  *string `json:"app_version"`
+type MatchedTrack struct {
+	Source Track   `json:"source"`
+	Target Track   `json:"target"`
+	Score  float64 `json:"score"`
 }

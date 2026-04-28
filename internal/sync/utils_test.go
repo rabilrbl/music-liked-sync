@@ -1,7 +1,9 @@
-package music_liked_sync
+package sync
 
 import (
 	"testing"
+
+	"github.com/rabilrbl/music-liked-sync/internal/model"
 )
 
 func TestNormalizeText(t *testing.T) {
@@ -53,9 +55,9 @@ func TestTrackSimilarity(t *testing.T) {
 	dur180 := 180000
 	dur181 := 181000
 	dur220 := 220000
-	t1 := Track{Title: "Song", Artists: []string{"Artist"}, SourceID: "1", DurationMs: &dur180}
-	t2 := Track{Title: "Song", Artists: []string{"Artist"}, SourceID: "2", DurationMs: &dur181}
-	t3 := Track{Title: "Song", Artists: []string{"Artist"}, SourceID: "3", DurationMs: &dur220}
+	t1 := model.Track{Title: "Song", Artists: []string{"Artist"}, SourceID: "1", DurationMs: &dur180}
+	t2 := model.Track{Title: "Song", Artists: []string{"Artist"}, SourceID: "2", DurationMs: &dur181}
+	t3 := model.Track{Title: "Song", Artists: []string{"Artist"}, SourceID: "3", DurationMs: &dur220}
 
 	if TrackSimilarity(t1, t2) <= TrackSimilarity(t1, t3) {
 		t.Errorf("Expected t1 similarity to t2 to be higher than to t3")

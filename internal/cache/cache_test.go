@@ -1,8 +1,10 @@
-package music_liked_sync
+package cache
 
 import (
 	"os"
 	"testing"
+
+	"github.com/rabilrbl/music-liked-sync/internal/model"
 )
 
 func TestCache(t *testing.T) {
@@ -15,8 +17,8 @@ func TestCache(t *testing.T) {
 	}
 	defer cache.Close()
 
-	track := Track{Title: "Song", Artists: []string{"Artist"}, SourceID: "123"}
-	target := Track{Title: "Song Target", Artists: []string{"Artist"}, SourceID: "456"}
+	track := model.Track{Title: "Song", Artists: []string{"Artist"}, SourceID: "123"}
+	target := model.Track{Title: "Song Target", Artists: []string{"Artist"}, SourceID: "456"}
 
 	if err := cache.StoreMatch("spotify_to_ytm", track, target); err != nil {
 		t.Errorf("Failed to store match: %v", err)

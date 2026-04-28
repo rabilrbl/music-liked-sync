@@ -1,4 +1,4 @@
-package music_liked_sync
+package ytmusic
 
 import (
 	"crypto/sha1"
@@ -14,9 +14,17 @@ import (
 	"github.com/go-resty/resty/v2"
 	"github.com/gofrs/flock"
 	"github.com/playwright-community/playwright-go"
+	"github.com/rabilrbl/music-liked-sync/internal/model"
 )
 
-const YTMusicBaseAPI = "https://music.youtube.com/youtubei/v1/"
+const (
+	YTMusicOrigin                = "https://music.youtube.com"
+	YTMusicBaseAPI               = "https://music.youtube.com/youtubei/v1/"
+	YTMusicRequiredCookie        = "__Secure-3PAPISID"
+	DefaultYTBrowserSessionDir   = "auth/ytmusic-browser-session"
+	DefaultYTBrowserLockFile     = "state/locks/ytmusic-browser-session.lock"
+	DefaultYTBrowserLoginTimeout = 300.0
+)
 
 var innertubeAPIKeyRE = regexp.MustCompile(`"INNERTUBE_API_KEY"\s*:\s*"([^"]+)"`)
 
@@ -91,7 +99,7 @@ func (b *YTMusicBackend) post(endpoint string, body map[string]interface{}) (map
 	return result, nil
 }
 
-func (b *YTMusicBackend) LikedTracks(verbose bool) ([]Track, error) {
+func (b *YTMusicBackend) LikedTracks(verbose bool) ([]model.Track, error) {
 	if verbose {
 		fmt.Println("Fetching YouTube Music liked songs...")
 	}
@@ -105,9 +113,7 @@ func (b *YTMusicBackend) LikedTracks(verbose bool) ([]Track, error) {
 		return nil, err
 	}
 
-	// Parsing the liked songs response is complex as it's a deep JSON.
-	// For simplicity, I'll extract tracks from the common locations.
-	var tracks []Track
+	var tracks []model.Track
 	extractYTMTracks(result, &tracks)
 
 	if verbose {
@@ -116,7 +122,7 @@ func (b *YTMusicBackend) LikedTracks(verbose bool) ([]Track, error) {
 	return tracks, nil
 }
 
-func extractYTMTracks(v interface{}, tracks *[]Track) {
+func extractYTMTracks(v interface{}, tracks *[]model.Track) {
 	switch val := v.(type) {
 	case map[string]interface{}:
 		if videoID, ok := val["videoId"].(string); ok {
@@ -138,7 +144,7 @@ func extractYTMTracks(v interface{}, tracks *[]Track) {
 				}
 			}
 			if title != "" {
-				*tracks = append(*tracks, Track{
+				*tracks = append(*tracks, model.Track{
 					Title:    title,
 					Artists:  artists,
 					SourceID: videoID,
@@ -156,7 +162,7 @@ func extractYTMTracks(v interface{}, tracks *[]Track) {
 	}
 }
 
-func (b *YTMusicBackend) SearchTrack(wanted Track, limit int) ([]Track, error) {
+func (b *YTMusicBackend) SearchTrack(wanted model.Track, limit int) ([]model.Track, error) {
 	query := fmt.Sprintf("%s %s", wanted.Title, strings.Join(wanted.Artists, " "))
 	payload := map[string]interface{}{
 		"query":  query,
@@ -168,7 +174,7 @@ func (b *YTMusicBackend) SearchTrack(wanted Track, limit int) ([]Track, error) {
 		return nil, err
 	}
 
-	var tracks []Track
+	var tracks []model.Track
 	extractYTMTracks(result, &tracks)
 	if len(tracks) > limit {
 		tracks = tracks[:limit]
@@ -176,7 +182,7 @@ func (b *YTMusicBackend) SearchTrack(wanted Track, limit int) ([]Track, error) {
 	return tracks, nil
 }
 
-func (b *YTMusicBackend) LikeTracks(tracks []Track, batchSize int, batchDelay float64, verbose bool) error {
+func (b *YTMusicBackend) LikeTracks(tracks []model.Track, batchSize int, batchDelay float64, verbose bool) error {
 	if verbose {
 		fmt.Printf("Liking %d tracks on YouTube Music...\n", len(tracks))
 	}
@@ -265,9 +271,9 @@ func EnsureYTBrowserAuth(sessionDir, lockFile string, headless bool, timeout flo
 
 	cookies, _ := context.Cookies(YTMusicOrigin)
 	cookieHeader := buildCookieHeader(cookies)
-	userAgent, _ := page.Evaluate("navigator.userAgent")
+	userAgentVal, _ := page.Evaluate("navigator.userAgent")
 
-	headers, err := buildYTBrowserAuthHeaders(cookieHeader, userAgent.(string))
+	headers, err := buildYTBrowserAuthHeaders(cookieHeader, userAgentVal.(string))
 	if err != nil {
 		return nil, err
 	}

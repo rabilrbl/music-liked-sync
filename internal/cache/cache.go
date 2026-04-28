@@ -1,4 +1,4 @@
-package music_liked_sync
+package cache
 
 import (
 	"database/sql"
@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/rabilrbl/music-liked-sync/internal/model"
+	"github.com/rabilrbl/music-liked-sync/internal/sync"
 	_ "modernc.org/sqlite"
 )
 
@@ -64,8 +66,8 @@ func (c *SyncCache) Close() error {
 	return c.db.Close()
 }
 
-func (c *SyncCache) StoreMatch(direction string, source, target Track) error {
-	sourceKey := NormalizeKey(source.Title, source.Artists)
+func (c *SyncCache) StoreMatch(direction string, source, target model.Track) error {
+	sourceKey := sync.NormalizeKey(source.Title, source.Artists)
 	sourceJSON, _ := json.Marshal(source)
 	targetJSON, _ := json.Marshal(target)
 	now := float64(time.Now().UnixNano()) / 1e9
@@ -81,8 +83,8 @@ func (c *SyncCache) StoreMatch(direction string, source, target Track) error {
 	return err
 }
 
-func (c *SyncCache) GetMatch(direction string, source Track) (*Track, error) {
-	sourceKey := NormalizeKey(source.Title, source.Artists)
+func (c *SyncCache) GetMatch(direction string, source model.Track) (*model.Track, error) {
+	sourceKey := sync.NormalizeKey(source.Title, source.Artists)
 	var targetJSON string
 	err := c.db.QueryRow("SELECT target_track_json FROM matches WHERE direction = ? AND source_key = ?", direction, sourceKey).Scan(&targetJSON)
 	if err == sql.ErrNoRows {
@@ -92,7 +94,7 @@ func (c *SyncCache) GetMatch(direction string, source Track) (*Track, error) {
 		return nil, err
 	}
 
-	var track Track
+	var track model.Track
 	if err := json.Unmarshal([]byte(targetJSON), &track); err != nil {
 		return nil, err
 	}
@@ -150,7 +152,7 @@ func (c *SyncCache) IsLiked(service, sourceID string) (bool, error) {
 	return true, nil
 }
 
-func (c *SyncCache) StoreLibrary(service string, tracks []Track) error {
+func (c *SyncCache) StoreLibrary(service string, tracks []model.Track) error {
 	payload, err := json.Marshal(tracks)
 	if err != nil {
 		return err
@@ -167,7 +169,7 @@ func (c *SyncCache) StoreLibrary(service string, tracks []Track) error {
 	return err
 }
 
-func (c *SyncCache) GetLibrary(service string, maxAgeSeconds float64) ([]Track, error) {
+func (c *SyncCache) GetLibrary(service string, maxAgeSeconds float64) ([]model.Track, error) {
 	if maxAgeSeconds <= 0 {
 		return nil, nil
 	}
@@ -186,7 +188,7 @@ func (c *SyncCache) GetLibrary(service string, maxAgeSeconds float64) ([]Track, 
 		return nil, nil
 	}
 
-	var tracks []Track
+	var tracks []model.Track
 	if err := json.Unmarshal([]byte(tracksJSON), &tracks); err != nil {
 		return nil, err
 	}
