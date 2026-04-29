@@ -148,7 +148,6 @@ def test_resolve_matches_respects_max_add(tmp_path):
     tracks = [
         Track(title=f"Song {i}", artists=("Artist",), source_id=f"yt{i}") for i in range(5)
     ]
-    found = Track(title="Found", artists=("Artist",), source_id="found")
 
     def search_fn(wanted):
         return [Track(title=wanted.title, artists=("Artist",), source_id=f"match-{wanted.source_id}")]
