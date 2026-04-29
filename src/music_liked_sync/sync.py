@@ -19,8 +19,7 @@ from .utils import (
 class _Progress:
     """Thread-safe progress reporter that uses stderr for status lines."""
 
-    def __init__(self, label: str, verbose: bool = False) -> None:
-        self.label = label
+    def __init__(self, verbose: bool = False) -> None:
         self.verbose = verbose
         self._lock = threading.Lock()
 
@@ -62,7 +61,7 @@ def compute_missing(left: Sequence[Track], right: Sequence[Track], verbose: bool
             if norm_a:
                 right_by_artist.setdefault(norm_a, []).append(track)
 
-    progress = _Progress("compute_missing", verbose)
+    progress = _Progress(verbose)
     missing = []
     for i, track in enumerate(left):
         if verbose and i % 100 == 0 and i > 0:
@@ -111,7 +110,7 @@ def resolve_matches(
     matched: list[tuple[Track, Track]] = []
     unmatched: list[Track] = []
     matched_lock = threading.Lock()
-    progress = _Progress(label, verbose)
+    progress = _Progress(verbose)
 
     candidates_to_process = list(missing if max_add is None else missing[:max_add])
     progress.log(f"Resolving matches for {len(candidates_to_process)} tracks ({label})...")
@@ -145,30 +144,31 @@ def resolve_matches(
         return SearchResult(wanted=wanted, match=match, search_failed=False)
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        for batch_index, chunk in enumerate(chunks):
-            futures = [executor.submit(process_track, wanted) for wanted in chunk]
-            for future in futures:
-                try:
-                    res = future.result()
-                    if res.search_failed:
-                        print(f"\n{label}: search failed for {res.wanted.display}; treating as unresolved ({res.error_summary})", file=sys.stderr)
-                        with matched_lock:
-                            unmatched.append(res.wanted)
-                    else:
-                        with matched_lock:
-                            if res.match:
-                                matched.append((res.wanted, res.match))
-                            else:
+        try:
+            for batch_index, chunk in enumerate(chunks):
+                futures = [executor.submit(process_track, wanted) for wanted in chunk]
+                for future in futures:
+                    try:
+                        res = future.result()
+                        if res.search_failed:
+                            progress.log(f"{label}: search failed for {res.wanted.display}; treating as unresolved ({res.error_summary})")
+                            with matched_lock:
                                 unmatched.append(res.wanted)
-                    with matched_lock:
-                        progress.status(f"{label}: {len(matched)} matched, {len(unmatched)} unmatched")
-                except RuntimeError:
-                    # Cancel pending futures and re-raise
-                    for f in futures:
-                        f.cancel()
-                    raise
+                        else:
+                            with matched_lock:
+                                if res.match:
+                                    matched.append((res.wanted, res.match))
+                                else:
+                                    unmatched.append(res.wanted)
+                        with matched_lock:
+                            progress.status(f"{label}: {len(matched)} matched, {len(unmatched)} unmatched")
+                    except RuntimeError:
+                        # Cancel pending futures and re-raise
+                        for f in futures:
+                            f.cancel()
+                        raise
 
-            sleep_between_batches(batch_index, len(chunks), batch_delay, sleep_fn)
-
-    progress.finalize()
+                sleep_between_batches(batch_index, len(chunks), batch_delay, sleep_fn)
+        finally:
+            progress.finalize()
     return matched, unmatched
