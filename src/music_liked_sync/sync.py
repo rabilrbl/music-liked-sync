@@ -15,6 +15,8 @@ from .utils import (
     sleep_between_batches,
 )
 
+_PROGRESS_WIDTH = 90
+
 
 class _Progress:
     """Thread-safe progress reporter that uses stderr for status lines."""
@@ -25,14 +27,13 @@ class _Progress:
 
     def clear(self) -> None:
         """Clear the current progress line."""
-        sys.stderr.write("\r" + " " * 90 + "\r")
+        sys.stderr.write("\r" + " " * _PROGRESS_WIDTH + "\r")
         sys.stderr.flush()
 
     def status(self, message: str) -> None:
         """Write an inline status line (overwrites previous), padded to clear stale chars."""
         with self._lock:
-            # Pad message to 90 chars to overwrite any previous longer status, then \r to stay on same line
-            padded = message[:90].ljust(90)
+            padded = message[:_PROGRESS_WIDTH].ljust(_PROGRESS_WIDTH)
             sys.stderr.write(f"\r{padded}")
             sys.stderr.flush()
 
@@ -154,14 +155,17 @@ def resolve_matches(
                             progress.log(f"{label}: search failed for {res.wanted.display}; treating as unresolved ({res.error_summary})")
                             with matched_lock:
                                 unmatched.append(res.wanted)
+                                n_matched = len(matched)
+                                n_unmatched = len(unmatched)
                         else:
                             with matched_lock:
                                 if res.match:
                                     matched.append((res.wanted, res.match))
                                 else:
                                     unmatched.append(res.wanted)
-                        with matched_lock:
-                            progress.status(f"{label}: {len(matched)} matched, {len(unmatched)} unmatched")
+                                n_matched = len(matched)
+                                n_unmatched = len(unmatched)
+                        progress.status(f"{label}: {n_matched} matched, {n_unmatched} unmatched")
                     except RuntimeError:
                         # Cancel pending futures and re-raise
                         for f in futures:
