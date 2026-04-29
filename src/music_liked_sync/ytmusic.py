@@ -17,11 +17,12 @@ from .constants import (
     DEFAULT_BATCH_SIZE,
 )
 from .models import Track
-from .spotify import _safe_page_user_agent, browser_session_lock
 from .utils import (
     batched,
+    browser_session_lock,
     cookie_value,
     playwright_cookie_header,
+    safe_page_user_agent,
     sleep_between_batches,
 )
 
@@ -97,7 +98,7 @@ def ensure_yt_browser_auth_from_session(
                 )
                 try:
                     page = context.pages[0] if context.pages else context.new_page()
-                    user_agent = _safe_page_user_agent(page)
+                    user_agent = safe_page_user_agent(page)
                     cookie_header = playwright_cookie_header(context.cookies([YTMUSIC_ORIGIN]))
 
                     if not cookie_value(cookie_header, YTMUSIC_REQUIRED_COOKIE):
@@ -110,7 +111,7 @@ def ensure_yt_browser_auth_from_session(
                     while not cookie_value(cookie_header, YTMUSIC_REQUIRED_COOKIE) and time.time() < deadline:
                         page.wait_for_timeout(2_000)
                         cookie_header = playwright_cookie_header(context.cookies([YTMUSIC_ORIGIN]))
-                        user_agent = _safe_page_user_agent(page)
+                        user_agent = safe_page_user_agent(page)
 
                     headers = build_yt_browser_auth_headers(cookie_header, user_agent=user_agent)
                     print(

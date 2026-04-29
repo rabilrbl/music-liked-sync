@@ -1,5 +1,3 @@
-import contextlib
-import fcntl
 import json
 import sys
 import time
@@ -11,7 +9,6 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from .constants import (
-    DEFAULT_BROWSER_USER_AGENT,
     DEFAULT_SPOTIFY_WEB_LOGIN_TIMEOUT,
     SPOTIFY_MAX_RETRY_AFTER,
     SPOTIFY_RETRY_ATTEMPTS,
@@ -27,43 +24,14 @@ from .constants import (
 from .models import SpotifyWebSessionState, Track
 from .utils import (
     batched,
+    browser_session_lock,
     cookie_value,
     playwright_cookie_header,
     primary_search_artist,
+    safe_page_user_agent,
     sleep_between_batches,
     truncate_query,
 )
-
-
-@contextlib.contextmanager
-def browser_session_lock(lock_path: Path):
-    lock_path.parent.mkdir(parents=True, exist_ok=True)
-    lock_file = lock_path.open("a+")
-    try:
-        try:
-            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError as exc:
-            raise RuntimeError(f"Browser session is already active (lock held): {lock_path}") from exc
-        yield
-    finally:
-        try:
-            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
-        finally:
-            lock_file.close()
-
-
-
-
-
-def _safe_page_user_agent(page, default: str = DEFAULT_BROWSER_USER_AGENT) -> str:
-    try:
-        value = page.evaluate("navigator.userAgent")
-    except Exception:
-        return default
-    return str(value or default)
-
-
-
 
 
 def spotify_web_token_from_payload(data: dict) -> str:
@@ -110,7 +78,7 @@ def wait_for_spotify_web_session_state(page, *, timeout_ms: int = 60_000) -> Spo
         raise RuntimeError("Spotify Web Player token response was not a JSON object")
     return SpotifyWebSessionState(
         access_token=spotify_web_token_from_payload(data),
-        user_agent=_safe_page_user_agent(page),
+        user_agent=safe_page_user_agent(page),
         client_token=captured_headers.get("client-token"),
         app_version=captured_headers.get("spotify-app-version"),
     )
@@ -147,12 +115,12 @@ def ensure_spotify_web_session_state_from_session(
                 )
                 try:
                     page = context.pages[0] if context.pages else context.new_page()
-                    user_agent = _safe_page_user_agent(page)
+                    user_agent = safe_page_user_agent(page)
                     cookie_header = playwright_cookie_header(context.cookies([SPOTIFY_WEB_ORIGIN]))
 
                     if not cookie_value(cookie_header, SPOTIFY_WEB_REQUIRED_COOKIE):
                         page.goto(SPOTIFY_WEB_ORIGIN, wait_until="domcontentloaded", timeout=60_000)
-                        user_agent = _safe_page_user_agent(page)
+                        user_agent = safe_page_user_agent(page)
                         print(
                             "Spotify Web Player login required. Complete login in the opened browser window; "
                             "this browser profile will be reused on future runs.",
@@ -161,7 +129,7 @@ def ensure_spotify_web_session_state_from_session(
                     while not cookie_value(cookie_header, SPOTIFY_WEB_REQUIRED_COOKIE) and time.time() < deadline:
                         page.wait_for_timeout(2_000)
                         cookie_header = playwright_cookie_header(context.cookies([SPOTIFY_WEB_ORIGIN]))
-                        user_agent = _safe_page_user_agent(page)
+                        user_agent = safe_page_user_agent(page)
 
                     if not cookie_value(cookie_header, SPOTIFY_WEB_REQUIRED_COOKIE):
                         raise RuntimeError(
@@ -226,7 +194,8 @@ def spotify_pathfinder_request_json(payload: dict, *, state: SpotifyWebSessionSt
         error_data = parsed["errors"]
         error_message = str(error_data)
         # Detect stale persisted query hashes — Spotify rotates these periodically
-        if "persisted query" in error_message.lower() or "hash" in error_message.lower():
+        lowered = error_message.lower()
+        if "persistedquerynotfound" in lowered or "persisted_query_not_found" in lowered or "persisted query" in lowered:
             raise SpotifyAPIError(
                 f"Spotify API persisted query hash appears stale or invalid. "
                 f"This typically means Spotify updated their API and the hardcoded SHA256 hashes "

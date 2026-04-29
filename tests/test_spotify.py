@@ -48,8 +48,8 @@ def test_safe_page_user_agent_falls_back_when_page_is_navigating():
             )
 
     assert (
-        music_liked_sync.spotify._safe_page_user_agent(NavigatingPage())
-        == music_liked_sync.spotify.DEFAULT_BROWSER_USER_AGENT
+        music_liked_sync.utils.safe_page_user_agent(NavigatingPage())
+        == music_liked_sync.constants.DEFAULT_BROWSER_USER_AGENT
     )
 
 

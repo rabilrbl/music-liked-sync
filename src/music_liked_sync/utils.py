@@ -1,11 +1,14 @@
+import contextlib
+import fcntl
 import json
 import re
 import unicodedata
 from collections.abc import Callable, Iterable, Sequence
 from difflib import SequenceMatcher
+from http.cookies import SimpleCookie
 from pathlib import Path
 
-from .constants import ARTIST_SPLIT_RE, COMMON_TITLE_SUFFIX_RE
+from .constants import ARTIST_SPLIT_RE, COMMON_TITLE_SUFFIX_RE, DEFAULT_BROWSER_USER_AGENT
 from .models import Track
 
 
@@ -153,8 +156,6 @@ def sleep_between_batches(
 
 def cookie_value(cookie_header: str, name: str) -> str | None:
     """Extract a named cookie value from a cookie header string."""
-    from http.cookies import SimpleCookie
-
     cookie = SimpleCookie()
     try:
         cookie.load(cookie_header.replace('"', ""))
@@ -181,3 +182,28 @@ def read_json_object(path: Path) -> dict:
     except (OSError, json.JSONDecodeError):
         return {}
     return data if isinstance(data, dict) else {}
+
+
+@contextlib.contextmanager
+def browser_session_lock(lock_path: Path):
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_file = lock_path.open("a+")
+    try:
+        try:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise RuntimeError(f"Browser session is already active (lock held): {lock_path}") from exc
+        yield
+    finally:
+        try:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+        finally:
+            lock_file.close()
+
+
+def safe_page_user_agent(page, default: str = DEFAULT_BROWSER_USER_AGENT) -> str:
+    try:
+        value = page.evaluate("navigator.userAgent")
+    except Exception:
+        return default
+    return str(value or default)
