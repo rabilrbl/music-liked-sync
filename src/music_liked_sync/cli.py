@@ -93,7 +93,6 @@ def main(argv: Sequence[str] | None = None) -> int:
     cache_path = Path(args.cache_db).expanduser()
     if not cache_path.is_absolute():
         cache_path = Path.cwd() / cache_path
-    cache = SyncCache(cache_path)
 
     try:
         ytm = YTMusicBackend(yt_auth_headers)
@@ -101,6 +100,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(str(exc), file=sys.stderr)
         return 2
 
+    cache = SyncCache(cache_path)
     try:
         spotify_liked = cache.get_library("spotify", args.cache_library_ttl) if args.cache_read else None
         if spotify_liked is None:
