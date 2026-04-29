@@ -98,8 +98,7 @@ def test_normalize_text_ampersand():
 def test_normalize_text_abbreviations():
     assert normalize_text("u r great") == "you are great"
     assert normalize_text("tea w/milk") == "tea withmilk"
-    # w/ regex matches before w/o can, so "w/o" becomes "witho" not "without"
-    assert normalize_text("tea w/o milk") == "tea witho milk"
+    assert normalize_text("tea w/o milk") == "tea without milk"
 
 
 def test_normalize_text_coke_studio():
