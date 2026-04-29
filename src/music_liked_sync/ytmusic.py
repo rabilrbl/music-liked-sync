@@ -19,24 +19,17 @@ from .constants import (
 from .models import Track
 from .utils import (
     batched,
+    browser_session_lock,
+    cookie_value,
+    playwright_cookie_header,
+    safe_page_user_agent,
     sleep_between_batches,
 )
-from .spotify import browser_session_lock, _safe_page_user_agent
 
-
-def _cookie_value(cookie_header: str, name: str) -> str | None:
-    from http.cookies import SimpleCookie
-    cookie = SimpleCookie()
-    try:
-        cookie.load(cookie_header.replace('"', ""))
-    except Exception:
-        return None
-    morsel = cookie.get(name)
-    return morsel.value if morsel else None
 
 
 def yt_sapisid_authorization(cookie_header: str, origin: str = YTMUSIC_ORIGIN, timestamp: int | None = None) -> str:
-    sapisid = _cookie_value(cookie_header, YTMUSIC_REQUIRED_COOKIE)
+    sapisid = cookie_value(cookie_header, YTMUSIC_REQUIRED_COOKIE)
     if not sapisid:
         raise RuntimeError(
             f"YouTube Music browser session is not logged in; missing {YTMUSIC_REQUIRED_COOKIE}. "
@@ -72,14 +65,6 @@ def build_yt_browser_auth_headers(
     }
 
 
-def _playwright_cookie_header(cookies: Sequence[dict]) -> str:
-    pairs = []
-    for cookie in sorted(cookies, key=lambda item: (str(item.get("name", "")), str(item.get("domain", "")))):
-        name = str(cookie.get("name", "")).strip()
-        value = str(cookie.get("value", ""))
-        if name:
-            pairs.append(f"{name}={value}")
-    return "; ".join(pairs)
 
 
 def ensure_yt_browser_auth_from_session(
@@ -113,20 +98,20 @@ def ensure_yt_browser_auth_from_session(
                 )
                 try:
                     page = context.pages[0] if context.pages else context.new_page()
-                    user_agent = _safe_page_user_agent(page)
-                    cookie_header = _playwright_cookie_header(context.cookies([YTMUSIC_ORIGIN]))
+                    user_agent = safe_page_user_agent(page)
+                    cookie_header = playwright_cookie_header(context.cookies([YTMUSIC_ORIGIN]))
 
-                    if not _cookie_value(cookie_header, YTMUSIC_REQUIRED_COOKIE):
+                    if not cookie_value(cookie_header, YTMUSIC_REQUIRED_COOKIE):
                         page.goto(YTMUSIC_ORIGIN, wait_until="domcontentloaded", timeout=60_000)
                         print(
                             "YouTube Music login required. Complete login in the opened browser window; "
                             "this browser profile will be reused on future runs.",
                             file=sys.stderr,
                         )
-                    while not _cookie_value(cookie_header, YTMUSIC_REQUIRED_COOKIE) and time.time() < deadline:
+                    while not cookie_value(cookie_header, YTMUSIC_REQUIRED_COOKIE) and time.time() < deadline:
                         page.wait_for_timeout(2_000)
-                        cookie_header = _playwright_cookie_header(context.cookies([YTMUSIC_ORIGIN]))
-                        user_agent = _safe_page_user_agent(page)
+                        cookie_header = playwright_cookie_header(context.cookies([YTMUSIC_ORIGIN]))
+                        user_agent = safe_page_user_agent(page)
 
                     headers = build_yt_browser_auth_headers(cookie_header, user_agent=user_agent)
                     print(

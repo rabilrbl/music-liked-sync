@@ -1,6 +1,6 @@
-import contextlib
 import json
 import sqlite3
+import threading
 import time
 from dataclasses import asdict
 from pathlib import Path
@@ -14,44 +14,48 @@ class SyncCache:
     def __init__(self, path: Path) -> None:
         self.path = path
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        conn = self._connect()
-        with contextlib.closing(conn):
-            conn.execute("PRAGMA journal_mode=WAL")
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS matches (
-                    direction TEXT NOT NULL,
-                    source_key TEXT NOT NULL,
-                    source_track_json TEXT NOT NULL,
-                    target_track_json TEXT NOT NULL,
-                    updated_at REAL NOT NULL,
-                    PRIMARY KEY (direction, source_key)
-                )
-                """
+        self._lock = threading.Lock()
+        self._conn = sqlite3.connect(self.path, check_same_thread=False)
+        self._conn.execute("PRAGMA journal_mode=WAL")
+        self._conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS matches (
+                direction TEXT NOT NULL,
+                source_key TEXT NOT NULL,
+                source_track_json TEXT NOT NULL,
+                target_track_json TEXT NOT NULL,
+                updated_at REAL NOT NULL,
+                PRIMARY KEY (direction, source_key)
             )
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS liked_tracks (
-                    service TEXT NOT NULL,
-                    source_id TEXT NOT NULL,
-                    updated_at REAL NOT NULL,
-                    PRIMARY KEY (service, source_id)
-                )
-                """
+            """
+        )
+        self._conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS liked_tracks (
+                service TEXT NOT NULL,
+                source_id TEXT NOT NULL,
+                updated_at REAL NOT NULL,
+                PRIMARY KEY (service, source_id)
             )
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS library_cache (
-                    service TEXT NOT NULL PRIMARY KEY,
-                    tracks_json TEXT NOT NULL,
-                    fetched_at REAL NOT NULL
-                )
-                """
+            """
+        )
+        self._conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS library_cache (
+                service TEXT NOT NULL PRIMARY KEY,
+                tracks_json TEXT NOT NULL,
+                fetched_at REAL NOT NULL
             )
-            conn.commit()
+            """
+        )
+        self._conn.commit()
 
-    def _connect(self) -> sqlite3.Connection:
-        return sqlite3.connect(self.path, check_same_thread=False)
+    def close(self) -> None:
+        """Close the persistent database connection."""
+        if self._conn is None:
+            return
+        self._conn.close()
+        self._conn = None  # type: ignore[assignment]
 
     @staticmethod
     def _serialize_track(track: Track) -> str:
@@ -71,9 +75,8 @@ class SyncCache:
     def store_match(self, direction: str, source: Track, target: Track) -> None:
         source_key = normalize_key(source.title, source.artists)
         now = time.time()
-        conn = self._connect()
-        with contextlib.closing(conn):
-            conn.execute(
+        with self._lock:
+            self._conn.execute(
                 """
                 INSERT INTO matches(direction, source_key, source_track_json, target_track_json, updated_at)
                 VALUES (?, ?, ?, ?, ?)
@@ -90,13 +93,12 @@ class SyncCache:
                     now,
                 ),
             )
-            conn.commit()
+            self._conn.commit()
 
     def get_match(self, direction: str, source: Track) -> Track | None:
         source_key = normalize_key(source.title, source.artists)
-        conn = self._connect()
-        with contextlib.closing(conn):
-            row = conn.execute(
+        with self._lock:
+            row = self._conn.execute(
                 "SELECT target_track_json FROM matches WHERE direction = ? AND source_key = ?",
                 (direction, source_key),
             ).fetchone()
@@ -115,9 +117,8 @@ class SyncCache:
         rows = [(service, source_id, now) for source_id in sorted(set(source_ids)) if source_id]
         if not rows:
             return
-        conn = self._connect()
-        with contextlib.closing(conn):
-            conn.executemany(
+        with self._lock:
+            self._conn.executemany(
                 """
                 INSERT INTO liked_tracks(service, source_id, updated_at)
                 VALUES (?, ?, ?)
@@ -126,12 +127,11 @@ class SyncCache:
                 """,
                 rows,
             )
-            conn.commit()
+            self._conn.commit()
 
     def is_liked(self, service: str, source_id: str) -> bool:
-        conn = self._connect()
-        with contextlib.closing(conn):
-            row = conn.execute(
+        with self._lock:
+            row = self._conn.execute(
                 "SELECT 1 FROM liked_tracks WHERE service = ? AND source_id = ? LIMIT 1",
                 (service, source_id),
             ).fetchone()
@@ -140,9 +140,8 @@ class SyncCache:
     def store_library(self, service: str, tracks: Sequence[Track]) -> None:
         payload = json.dumps([asdict(track) for track in tracks], ensure_ascii=False)
         now = time.time()
-        conn = self._connect()
-        with contextlib.closing(conn):
-            conn.execute(
+        with self._lock:
+            self._conn.execute(
                 """
                 INSERT INTO library_cache(service, tracks_json, fetched_at)
                 VALUES (?, ?, ?)
@@ -152,14 +151,13 @@ class SyncCache:
                 """,
                 (service, payload, now),
             )
-            conn.commit()
+            self._conn.commit()
 
     def get_library(self, service: str, max_age_seconds: float) -> list[Track] | None:
         if max_age_seconds <= 0:
             return None
-        conn = self._connect()
-        with contextlib.closing(conn):
-            row = conn.execute(
+        with self._lock:
+            row = self._conn.execute(
                 "SELECT tracks_json, fetched_at FROM library_cache WHERE service = ?",
                 (service,),
             ).fetchone()

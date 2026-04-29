@@ -14,7 +14,7 @@ Defaults are safe and session-first:
 
 ## Requirements
 
-- Python 3.11+
+- Python 3.13+
 - [`uv`](https://docs.astral.sh/uv/)
 - Chromium via Playwright (`uv run playwright install chromium`)
 - Active Spotify and YouTube Music account sessions in browser on first run
