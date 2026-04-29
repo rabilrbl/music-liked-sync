@@ -25,8 +25,8 @@ def normalize_text(value: str, artists: Sequence[str] | None = None) -> str:
     # Handle common abbreviations
     text = re.sub(r"\bu\b", "you", text)
     text = re.sub(r"\br\b", "are", text)
-    text = re.sub(r"\bw/\b", "with", text)
     text = re.sub(r"\bw/o\b", "without", text)
+    text = re.sub(r"\bw/\b", "with", text)
     
     # Aggressively strip metadata after common YTM delimiters
     # e.g., "Song Name | Season 14 | Pasoori" -> "Song Name Pasoori"
