@@ -52,9 +52,10 @@ class SyncCache:
 
     def close(self) -> None:
         """Close the persistent database connection."""
-        if self._conn:
-            self._conn.close()
-            self._conn = None  # type: ignore[assignment]
+        if self._conn is None:
+            return
+        self._conn.close()
+        self._conn = None  # type: ignore[assignment]
 
     @staticmethod
     def _serialize_track(track: Track) -> str:
@@ -96,10 +97,11 @@ class SyncCache:
 
     def get_match(self, direction: str, source: Track) -> Track | None:
         source_key = normalize_key(source.title, source.artists)
-        row = self._conn.execute(
-            "SELECT target_track_json FROM matches WHERE direction = ? AND source_key = ?",
-            (direction, source_key),
-        ).fetchone()
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT target_track_json FROM matches WHERE direction = ? AND source_key = ?",
+                (direction, source_key),
+            ).fetchone()
         if not row:
             return None
         try:
@@ -128,10 +130,11 @@ class SyncCache:
             self._conn.commit()
 
     def is_liked(self, service: str, source_id: str) -> bool:
-        row = self._conn.execute(
-            "SELECT 1 FROM liked_tracks WHERE service = ? AND source_id = ? LIMIT 1",
-            (service, source_id),
-        ).fetchone()
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT 1 FROM liked_tracks WHERE service = ? AND source_id = ? LIMIT 1",
+                (service, source_id),
+            ).fetchone()
         return row is not None
 
     def store_library(self, service: str, tracks: Sequence[Track]) -> None:
@@ -153,10 +156,11 @@ class SyncCache:
     def get_library(self, service: str, max_age_seconds: float) -> list[Track] | None:
         if max_age_seconds <= 0:
             return None
-        row = self._conn.execute(
-            "SELECT tracks_json, fetched_at FROM library_cache WHERE service = ?",
-            (service,),
-        ).fetchone()
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT tracks_json, fetched_at FROM library_cache WHERE service = ?",
+                (service,),
+            ).fetchone()
         if not row:
             return None
         tracks_json, fetched_at = row
