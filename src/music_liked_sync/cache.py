@@ -15,7 +15,7 @@ class SyncCache:
         self.path = path
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.Lock()
-        self._conn = sqlite3.connect(self.path, check_same_thread=False)
+        self._conn: sqlite3.Connection | None = sqlite3.connect(self.path, check_same_thread=False)
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute(
             """
@@ -50,12 +50,17 @@ class SyncCache:
         )
         self._conn.commit()
 
+    def _ensure_conn(self) -> sqlite3.Connection:
+        if self._conn is None:
+            raise RuntimeError("database connection is closed")
+        return self._conn
+
     def close(self) -> None:
         """Close the persistent database connection."""
         if self._conn is None:
             return
         self._conn.close()
-        self._conn = None  # type: ignore[assignment]
+        self._conn = None
 
     @staticmethod
     def _serialize_track(track: Track) -> str:
@@ -73,10 +78,11 @@ class SyncCache:
         )
 
     def store_match(self, direction: str, source: Track, target: Track) -> None:
+        conn = self._ensure_conn()
         source_key = normalize_key(source.title, source.artists)
         now = time.time()
         with self._lock:
-            self._conn.execute(
+            conn.execute(
                 """
                 INSERT INTO matches(direction, source_key, source_track_json, target_track_json, updated_at)
                 VALUES (?, ?, ?, ?, ?)
@@ -93,12 +99,13 @@ class SyncCache:
                     now,
                 ),
             )
-            self._conn.commit()
+            conn.commit()
 
     def get_match(self, direction: str, source: Track) -> Track | None:
+        conn = self._ensure_conn()
         source_key = normalize_key(source.title, source.artists)
         with self._lock:
-            row = self._conn.execute(
+            row = conn.execute(
                 "SELECT target_track_json FROM matches WHERE direction = ? AND source_key = ?",
                 (direction, source_key),
             ).fetchone()
@@ -113,12 +120,13 @@ class SyncCache:
         self.mark_liked_many(service, [source_id])
 
     def mark_liked_many(self, service: str, source_ids: Sequence[str]) -> None:
+        conn = self._ensure_conn()
         now = time.time()
         rows = [(service, source_id, now) for source_id in sorted(set(source_ids)) if source_id]
         if not rows:
             return
         with self._lock:
-            self._conn.executemany(
+            conn.executemany(
                 """
                 INSERT INTO liked_tracks(service, source_id, updated_at)
                 VALUES (?, ?, ?)
@@ -127,21 +135,23 @@ class SyncCache:
                 """,
                 rows,
             )
-            self._conn.commit()
+            conn.commit()
 
     def is_liked(self, service: str, source_id: str) -> bool:
+        conn = self._ensure_conn()
         with self._lock:
-            row = self._conn.execute(
+            row = conn.execute(
                 "SELECT 1 FROM liked_tracks WHERE service = ? AND source_id = ? LIMIT 1",
                 (service, source_id),
             ).fetchone()
         return row is not None
 
     def store_library(self, service: str, tracks: Sequence[Track]) -> None:
+        conn = self._ensure_conn()
         payload = json.dumps([asdict(track) for track in tracks], ensure_ascii=False)
         now = time.time()
         with self._lock:
-            self._conn.execute(
+            conn.execute(
                 """
                 INSERT INTO library_cache(service, tracks_json, fetched_at)
                 VALUES (?, ?, ?)
@@ -151,13 +161,14 @@ class SyncCache:
                 """,
                 (service, payload, now),
             )
-            self._conn.commit()
+            conn.commit()
 
     def get_library(self, service: str, max_age_seconds: float) -> list[Track] | None:
+        conn = self._ensure_conn()
         if max_age_seconds <= 0:
             return None
         with self._lock:
-            row = self._conn.execute(
+            row = conn.execute(
                 "SELECT tracks_json, fetched_at FROM library_cache WHERE service = ?",
                 (service,),
             ).fetchone()
