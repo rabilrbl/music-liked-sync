@@ -116,3 +116,26 @@ def test_close_idempotent(tmp_path):
     cache = SyncCache(tmp_path / "cache.db")
     cache.close()
     cache.close()  # second close must not raise
+
+
+def test_mark_liked_many_with_data(tmp_path):
+    cache = SyncCache(tmp_path / "cache.db")
+    ids = ["id3", "id1", "id2"]
+    cache.mark_liked_many("ytm", ids)
+    assert cache.is_liked("ytm", "id1")
+    assert cache.is_liked("ytm", "id2")
+    assert cache.is_liked("ytm", "id3")
+
+
+def test_mark_liked_many_deduplicates(tmp_path):
+    cache = SyncCache(tmp_path / "cache.db")
+    cache.mark_liked_many("ytm", ["a", "a", "b"])
+    assert cache.is_liked("ytm", "a")
+    assert cache.is_liked("ytm", "b")
+
+
+def test_mark_liked_many_filters_empty_strings(tmp_path):
+    cache = SyncCache(tmp_path / "cache.db")
+    cache.mark_liked_many("ytm", ["", "valid", ""])
+    assert not cache.is_liked("ytm", "")
+    assert cache.is_liked("ytm", "valid")
