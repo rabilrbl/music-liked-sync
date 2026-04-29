@@ -1,3 +1,5 @@
+import threading
+
 from music_liked_sync.cache import SyncCache
 from music_liked_sync.models import Track
 
@@ -69,3 +71,48 @@ def test_get_library_deserialization_error(tmp_path):
     cache._conn.execute("UPDATE library_cache SET tracks_json = '\"not a list\"'")
     cache._conn.commit()
     assert cache.get_library("s", 3600) is None
+
+
+def test_concurrent_read_write(tmp_path):
+    """Regression test: concurrent reads+writes must not raise InterfaceError."""
+    cache = SyncCache(tmp_path / "cache.db")
+    source = Track(title="S", artists=("A",), source_id="1")
+
+    errors: list[Exception] = []
+
+    def writer():
+        try:
+            for i in range(50):
+                t = Track(title=f"S{i}", artists=("A",), source_id=str(i))
+                cache.store_match("dir", t, t)
+                cache.mark_liked("svc", str(i))
+        except Exception as exc:
+            errors.append(exc)
+
+    def reader():
+        try:
+            for _ in range(50):
+                cache.get_match("dir", source)
+                cache.is_liked("svc", "1")
+        except Exception as exc:
+            errors.append(exc)
+
+    threads = [
+        threading.Thread(target=writer),
+        threading.Thread(target=writer),
+        threading.Thread(target=reader),
+        threading.Thread(target=reader),
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert not errors, f"Concurrent access errors: {errors}"
+
+
+def test_close_idempotent(tmp_path):
+    """close() can be called multiple times without error."""
+    cache = SyncCache(tmp_path / "cache.db")
+    cache.close()
+    cache.close()  # second close must not raise
