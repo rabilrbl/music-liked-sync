@@ -21,7 +21,7 @@ from .constants import (
     DEFAULT_BATCH_SIZE,
     DEFAULT_MARKET,
 )
-from .models import SpotifyWebSessionState, Track
+from .models import FatalSearchError, SpotifyWebSessionState, Track
 from .utils import (
     batched,
     browser_session_lock,
@@ -156,7 +156,7 @@ def ensure_spotify_web_session_state_from_session(
         ) from exc
 
 
-class SpotifyAPIError(RuntimeError):
+class SpotifyAPIError(Exception):
     def __init__(self, message: str, *, http_status: int | None = None, headers: dict[str, str] | None = None) -> None:
         super().__init__(message)
         self.http_status = http_status
@@ -286,6 +286,11 @@ def build_spotify_search_queries(wanted: Track) -> list[str]:
 
 def is_spotify_query_too_long_error(exc: BaseException) -> bool:
     return "query exceeds maximum length" in str(exc).lower()
+
+
+def _is_persisted_query_error(exc: SpotifyAPIError) -> bool:
+    lowered = str(exc).lower()
+    return any(phrase in lowered for phrase in ("persistedquerynotfound", "persisted_query_not_found", "persisted query"))
 
 
 def spotify_retry_delay_seconds(
@@ -535,6 +540,10 @@ class SpotifyBackend:
                     lambda query=query: self.client.search(q=query, type="track", limit=limit, market=self.market),
                     label="Spotify search",
                 )
+            except SpotifyAPIError as exc:
+                if _is_persisted_query_error(exc):
+                    raise FatalSearchError(str(exc)) from exc
+                raise
             except Exception as exc:
                 if is_spotify_query_too_long_error(exc):
                     continue
