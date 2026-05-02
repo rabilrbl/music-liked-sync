@@ -7,6 +7,7 @@ from concurrent.futures import ThreadPoolExecutor
 from hashlib import sha1
 from pathlib import Path
 
+from .browser_auth import BrowserSessionConfig, ensure_browser_session
 from .constants import (
     DEFAULT_YT_BROWSER_LOGIN_TIMEOUT,
     YTMUSIC_ORIGIN,
@@ -19,10 +20,7 @@ from .constants import (
 from .models import Track
 from .utils import (
     batched,
-    browser_session_lock,
     cookie_value,
-    playwright_cookie_header,
-    safe_page_user_agent,
     sleep_between_batches,
 )
 
@@ -74,58 +72,22 @@ def ensure_yt_browser_auth_from_session(
     login_timeout_seconds: float = DEFAULT_YT_BROWSER_LOGIN_TIMEOUT,
     lock_path: Path | str,
 ) -> dict[str, str]:
-    try:
-        from playwright.sync_api import Error as PlaywrightError
-        from playwright.sync_api import sync_playwright
-    except ImportError as exc:
-        raise RuntimeError(
-            "YouTube browser-session auth requires Playwright. Run: uv sync && uv run playwright install chromium"
-        ) from exc
-
-    session_dir.mkdir(parents=True, exist_ok=True)
     lock_path = Path(lock_path).expanduser()
     if not lock_path.is_absolute():
         lock_path = Path.cwd() / lock_path
-    deadline = time.time() + login_timeout_seconds
-
-    try:
-        with browser_session_lock(lock_path):
-            with sync_playwright() as p:
-                context = p.chromium.launch_persistent_context(
-                    str(session_dir),
-                    headless=headless,
-                    args=["--disable-blink-features=AutomationControlled"],
-                )
-                try:
-                    page = context.pages[0] if context.pages else context.new_page()
-                    user_agent = safe_page_user_agent(page)
-                    cookie_header = playwright_cookie_header(context.cookies([YTMUSIC_ORIGIN]))
-
-                    if not cookie_value(cookie_header, YTMUSIC_REQUIRED_COOKIE):
-                        page.goto(YTMUSIC_ORIGIN, wait_until="domcontentloaded", timeout=60_000)
-                        print(
-                            "YouTube Music login required. Complete login in the opened browser window; "
-                            "this browser profile will be reused on future runs.",
-                            file=sys.stderr,
-                        )
-                    while not cookie_value(cookie_header, YTMUSIC_REQUIRED_COOKIE) and time.time() < deadline:
-                        page.wait_for_timeout(2_000)
-                        cookie_header = playwright_cookie_header(context.cookies([YTMUSIC_ORIGIN]))
-                        user_agent = safe_page_user_agent(page)
-
-                    headers = build_yt_browser_auth_headers(cookie_header, user_agent=user_agent)
-                    print(
-                        "YouTube Music browser session auth refreshed from persistent browser session",
-                        file=sys.stderr,
-                    )
-                    return headers
-                finally:
-                    context.close()
-    except PlaywrightError as exc:
-        raise RuntimeError(
-            "Could not open the persistent YouTube Music browser session. "
-            "If this is the first run, install the browser with: uv run playwright install chromium"
-        ) from exc
+    config = BrowserSessionConfig(
+        session_dir=session_dir,
+        origin=YTMUSIC_ORIGIN,
+        required_cookie=YTMUSIC_REQUIRED_COOKIE,
+        lock_path=lock_path,
+        label="YouTube Music",
+        headless=headless,
+        login_timeout_seconds=login_timeout_seconds,
+    )
+    return ensure_browser_session(
+        config,
+        lambda page, cookie_header, user_agent: build_yt_browser_auth_headers(cookie_header, user_agent=user_agent),
+    )
 
 
 def parse_ytm_track(item: dict) -> Track | None:
