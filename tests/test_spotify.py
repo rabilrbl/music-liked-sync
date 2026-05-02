@@ -35,7 +35,7 @@ def test_spotify_web_client_retries_once_after_401(monkeypatch):
 
     tokens = iter([("expired-token", "ua1"), ("fresh-token", "ua2")])
     monkeypatch.setattr(
-        music_liked_sync.spotify, "spotify_pathfinder_request_json", fake_request
+        music_liked_sync._spotify_client, "spotify_pathfinder_request_json", fake_request
     )
 
     client = music_liked_sync.spotify.SpotifyWebClient(lambda: next(tokens))
