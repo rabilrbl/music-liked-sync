@@ -1,22 +1,24 @@
-import json
-import os
 import sys
 import time
-import urllib.error
-import urllib.parse
-import urllib.request
 from collections.abc import Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+from ._spotify_client import (
+    SpotifyAPIError as SpotifyAPIError,
+    SpotifyWebClient as SpotifyWebClient,
+    is_spotify_query_too_long_error as is_spotify_query_too_long_error,
+    is_spotify_transient_error as is_spotify_transient_error,
+    parse_spotify_track as parse_spotify_track,
+    retry_spotify_call as retry_spotify_call,
+    spotify_graphql_library_item_to_api_item as spotify_graphql_library_item_to_api_item,
+    spotify_graphql_track_to_api_track as spotify_graphql_track_to_api_track,
+    spotify_pathfinder_request_json as spotify_pathfinder_request_json,
+    spotify_retry_delay_seconds as spotify_retry_delay_seconds,
+)
+from .browser_auth import BrowserSessionConfig, ensure_browser_session
 from .constants import (
     DEFAULT_SPOTIFY_WEB_LOGIN_TIMEOUT,
-    SPOTIFY_LIBRARY_QUERY_HASH,
-    SPOTIFY_SAVE_QUERY_HASH,
-    SPOTIFY_SEARCH_QUERY_HASH,
-    SPOTIFY_MAX_RETRY_AFTER,
-    SPOTIFY_RETRY_ATTEMPTS,
-    SPOTIFY_RETRY_BASE_DELAY,
     SPOTIFY_WEB_ORIGIN,
     SPOTIFY_WEB_PATHFINDER_URL,
     SPOTIFY_WEB_REQUIRED_COOKIE,
@@ -25,21 +27,14 @@ from .constants import (
     DEFAULT_BATCH_SIZE,
     DEFAULT_MARKET,
 )
-from .models import SpotifyWebSessionState, Track
+from .models import FatalSearchError, SpotifyWebSessionState, Track
 from .utils import (
     batched,
-    browser_session_lock,
-    cookie_value,
-    playwright_cookie_header,
     primary_search_artist,
     safe_page_user_agent,
     sleep_between_batches,
     truncate_query,
 )
-
-_LIBRARY_HASH = os.environ.get("SPOTIFY_LIBRARY_QUERY_HASH", SPOTIFY_LIBRARY_QUERY_HASH)
-_SEARCH_HASH = os.environ.get("SPOTIFY_SEARCH_QUERY_HASH", SPOTIFY_SEARCH_QUERY_HASH)
-_SAVE_HASH = os.environ.get("SPOTIFY_SAVE_QUERY_HASH", SPOTIFY_SAVE_QUERY_HASH)
 
 
 def spotify_web_token_from_payload(data: dict) -> str:
@@ -99,175 +94,38 @@ def ensure_spotify_web_session_state_from_session(
     login_timeout_seconds: float = DEFAULT_SPOTIFY_WEB_LOGIN_TIMEOUT,
     lock_path: Path | str,
 ) -> SpotifyWebSessionState:
-    try:
-        from playwright.sync_api import Error as PlaywrightError
-        from playwright.sync_api import sync_playwright
-    except ImportError as exc:
-        raise RuntimeError(
-            "Spotify web-session auth requires Playwright. Run: uv sync && uv run playwright install chromium"
-        ) from exc
-
-    session_dir.mkdir(parents=True, exist_ok=True)
     lock_path = Path(lock_path).expanduser()
     if not lock_path.is_absolute():
         lock_path = Path.cwd() / lock_path
-    deadline = time.time() + login_timeout_seconds
 
-    try:
-        with browser_session_lock(lock_path):
-            with sync_playwright() as p:
-                context = p.chromium.launch_persistent_context(
-                    str(session_dir),
-                    headless=headless,
-                    args=["--disable-blink-features=AutomationControlled"],
-                )
-                try:
-                    page = context.pages[0] if context.pages else context.new_page()
-                    user_agent = safe_page_user_agent(page)
-                    cookie_header = playwright_cookie_header(context.cookies([SPOTIFY_WEB_ORIGIN]))
-
-                    if not cookie_value(cookie_header, SPOTIFY_WEB_REQUIRED_COOKIE):
-                        page.goto(SPOTIFY_WEB_ORIGIN, wait_until="domcontentloaded", timeout=60_000)
-                        user_agent = safe_page_user_agent(page)
-                        print(
-                            "Spotify Web Player login required. Complete login in the opened browser window; "
-                            "this browser profile will be reused on future runs.",
-                            file=sys.stderr,
-                        )
-                    while not cookie_value(cookie_header, SPOTIFY_WEB_REQUIRED_COOKIE) and time.time() < deadline:
-                        page.wait_for_timeout(2_000)
-                        cookie_header = playwright_cookie_header(context.cookies([SPOTIFY_WEB_ORIGIN]))
-                        user_agent = safe_page_user_agent(page)
-
-                    if not cookie_value(cookie_header, SPOTIFY_WEB_REQUIRED_COOKIE):
-                        raise RuntimeError(
-                            f"Spotify Web Player session is not logged in; missing {SPOTIFY_WEB_REQUIRED_COOKIE}. "
-                            "Complete Spotify login in the opened browser window, then rerun."
-                        )
-
-                    state = wait_for_spotify_web_session_state(page)
-                    if not state.user_agent:
-                        state = SpotifyWebSessionState(
-                            access_token=state.access_token,
-                            user_agent=user_agent,
-                            client_token=state.client_token,
-                            app_version=state.app_version,
-                        )
-                    print("Spotify Web Player token refreshed from persistent browser session", file=sys.stderr)
-                    return state
-                finally:
-                    context.close()
-    except PlaywrightError as exc:
-        raise RuntimeError(
-            "Could not open the persistent Spotify Web Player browser session. "
-            "If this is the first run, install the browser with: uv run playwright install chromium"
-        ) from exc
-
-
-class SpotifyAPIError(RuntimeError):
-    def __init__(self, message: str, *, http_status: int | None = None, headers: dict[str, str] | None = None) -> None:
-        super().__init__(message)
-        self.http_status = http_status
-        self.headers = headers or {}
-
-
-def spotify_pathfinder_request_json(payload: dict, *, state: SpotifyWebSessionState):
-    headers = {
-        "accept": "application/json",
-        "app-platform": "WebPlayer",
-        "authorization": f"Bearer {state.access_token}",
-        "content-type": "application/json;charset=UTF-8",
-        "origin": SPOTIFY_WEB_ORIGIN,
-        "referer": f"{SPOTIFY_WEB_ORIGIN}/",
-        "user-agent": state.user_agent,
-    }
-    if state.client_token:
-        headers["client-token"] = state.client_token
-    if state.app_version:
-        headers["spotify-app-version"] = state.app_version
-    data = json.dumps(payload, separators=(",", ":")).encode("utf-8")
-    request = urllib.request.Request(SPOTIFY_WEB_PATHFINDER_URL, data=data, headers=headers, method="POST")
-    try:
-        with urllib.request.urlopen(request, timeout=60) as response:
-            raw = response.read()
-    except urllib.error.HTTPError as exc:
-        body = exc.read().decode("utf-8", errors="replace")
-        raise SpotifyAPIError(
-            f"Spotify Web Player pathfinder HTTP {exc.code}: {body}",
-            http_status=exc.code,
-            headers=dict(exc.headers.items()),
-        ) from exc
-    parsed = json.loads(raw.decode("utf-8")) if raw else {}
-    if isinstance(parsed, dict) and parsed.get("errors"):
-        error_data = parsed["errors"]
-        error_message = str(error_data)
-        # Detect stale persisted query hashes — Spotify rotates these periodically
-        lowered = error_message.lower()
-        if "persistedquerynotfound" in lowered or "persisted_query_not_found" in lowered or "persisted query" in lowered:
-            raise SpotifyAPIError(
-                f"Spotify API persisted query hash appears stale or invalid. "
-                f"This typically means Spotify updated their API and the hardcoded SHA256 hashes "
-                f"need updating. Error detail: {error_message}. "
-                f"Please file an issue at https://github.com/rabilrbl/music-liked-sync/issues"
+    def _extract_state(page, cookie_header, user_agent):
+        state = wait_for_spotify_web_session_state(page)
+        if not state.user_agent:
+            state = SpotifyWebSessionState(
+                access_token=state.access_token,
+                user_agent=user_agent,
+                client_token=state.client_token,
+                app_version=state.app_version,
             )
-        raise SpotifyAPIError(f"Spotify Web Player pathfinder returned errors: {error_data}")
-    return parsed
+        return state
 
-
-def spotify_graphql_track_to_api_track(wrapper: dict) -> dict | None:
-    data = wrapper.get("data") if isinstance(wrapper.get("data"), dict) else wrapper
-    if not isinstance(data, dict) or data.get("__typename") not in {"Track", None}:
-        return None
-    uri = str(wrapper.get("_uri") or data.get("uri") or data.get("_uri") or "")
-    track_id = str(data.get("id") or (uri.split(":")[-1] if uri else ""))
-    name = data.get("name")
-    if not track_id or not name:
-        return None
-    artists = []
-    for artist in ((data.get("artists") or {}).get("items") or []):
-        if isinstance(artist, dict):
-            artist_name = ((artist.get("profile") or {}).get("name") or artist.get("name"))
-            if artist_name:
-                artists.append({"name": artist_name})
-    album_data = data.get("albumOfTrack") or data.get("album") or {}
-    duration = data.get("duration") or {}
-    duration_ms = data.get("duration_ms") or duration.get("totalMilliseconds")
-    return {
-        "id": track_id,
-        "name": name,
-        "artists": artists,
-        "duration_ms": duration_ms,
-        "album": {"name": album_data.get("name")},
-    }
-
-
-def spotify_graphql_library_item_to_api_item(item: dict) -> dict | None:
-    track = item.get("track") if isinstance(item.get("track"), dict) else None
-    if not track:
-        return None
-    parsed = spotify_graphql_track_to_api_track(track)
-    return {"track": parsed} if parsed else None
-
-
-def parse_spotify_track(item: dict) -> Track | None:
-    track = item.get("track", item) or {}
-    if not track.get("id") or not track.get("name"):
-        return None
-    artists = tuple(a.get("name", "") for a in track.get("artists", []) if a.get("name"))
-    return Track(
-        title=track["name"],
-        artists=artists,
-        source_id=f"spotify:track:{track['id']}",
-        duration_ms=track.get("duration_ms"),
-        album=(track.get("album") or {}).get("name"),
+    config = BrowserSessionConfig(
+        session_dir=session_dir,
+        origin=SPOTIFY_WEB_ORIGIN,
+        required_cookie=SPOTIFY_WEB_REQUIRED_COOKIE,
+        lock_path=lock_path,
+        label="Spotify Web Player",
+        headless=headless,
+        login_timeout_seconds=login_timeout_seconds,
     )
+    return ensure_browser_session(config, _extract_state)
 
 
 def build_spotify_search_queries(wanted: Track) -> list[str]:
     seen: set[str] = set()
     queries: list[str] = []
     from .utils import normalize_text, normalize_artist
-    
+
     title = wanted.title.strip()
     norm_title = normalize_text(title, wanted.artists)
     primary_artist = primary_search_artist(wanted.artists)
@@ -292,175 +150,9 @@ def build_spotify_search_queries(wanted: Track) -> list[str]:
     return queries
 
 
-def is_spotify_query_too_long_error(exc: BaseException) -> bool:
-    return "query exceeds maximum length" in str(exc).lower()
-
-
-def spotify_retry_delay_seconds(
-    exc: BaseException,
-    attempt: int,
-    *,
-    base_delay: float = SPOTIFY_RETRY_BASE_DELAY,
-    max_retry_after: float = SPOTIFY_MAX_RETRY_AFTER,
-) -> float:
-    headers = getattr(exc, "headers", {}) or {}
-    retry_after = headers.get("Retry-After")
-    if retry_after is not None:
-        try:
-            parsed = float(retry_after)
-        except (TypeError, ValueError):
-            parsed = None
-        if parsed is not None and parsed >= 0:
-            return min(parsed, max_retry_after)
-    return min(base_delay * attempt, max_retry_after)
-
-
-def is_spotify_transient_error(exc: BaseException) -> bool:
-    return getattr(exc, "http_status", None) in {429, 500, 502, 503, 504}
-
-
-def retry_spotify_call(
-    fn,
-    *,
-    label: str,
-    attempts: int = SPOTIFY_RETRY_ATTEMPTS,
-    base_delay: float = SPOTIFY_RETRY_BASE_DELAY,
-    max_retry_after: float = SPOTIFY_MAX_RETRY_AFTER,
-    sleep_fn: Callable[[float], None] = time.sleep,
-):
-    last_exc: Exception | None = None
-    for attempt in range(1, attempts + 1):
-        try:
-            return fn()
-        except Exception as exc:
-            if is_spotify_query_too_long_error(exc):
-                raise
-            if not is_spotify_transient_error(exc):
-                raise
-            last_exc = exc
-            if attempt >= attempts:
-                raise
-            delay = spotify_retry_delay_seconds(exc, attempt, base_delay=base_delay, max_retry_after=max_retry_after)
-            print(
-                f"{label}: transient Spotify error {getattr(exc, 'http_status', 'unknown')}; retry {attempt}/{attempts - 1} in {delay:.1f}s",
-                file=sys.stderr,
-            )
-            sleep_fn(delay)
-    if last_exc:
-        raise last_exc
-
-
-class SpotifyWebClient:
-    def __init__(self, token_provider: Callable[[], SpotifyWebSessionState | tuple[str, str]]) -> None:
-        self._token_provider = token_provider
-        self._state = self._normalize_state(token_provider())
-
-    @staticmethod
-    def _normalize_state(state: SpotifyWebSessionState | tuple[str, str]) -> SpotifyWebSessionState:
-        if isinstance(state, SpotifyWebSessionState):
-            return state
-        access_token, user_agent = state
-        return SpotifyWebSessionState(access_token=access_token, user_agent=user_agent)
-
-    def _refresh_token(self) -> None:
-        self._state = self._normalize_state(self._token_provider())
-
-    def _pathfinder(self, payload: dict):
-        try:
-            return spotify_pathfinder_request_json(payload, state=self._state)
-        except SpotifyAPIError as exc:
-            if exc.http_status != 401:
-                raise
-            self._refresh_token()
-            return spotify_pathfinder_request_json(payload, state=self._state)
-
-    def current_user_saved_tracks(self, *, limit: int, offset: int, market: str):
-        del market
-        payload = {
-            "variables": {"offset": offset, "limit": limit},
-            "operationName": "fetchLibraryTracks",
-            "extensions": {
-                "persistedQuery": {
-                    "version": 1,
-                    "sha256Hash": _LIBRARY_HASH,
-                }
-            },
-        }
-        data = self._pathfinder(payload)
-        tracks = (((data.get("data") or {}).get("me") or {}).get("library") or {}).get("tracks") or {}
-        items = []
-        for item in tracks.get("items") or []:
-            parsed = spotify_graphql_library_item_to_api_item(item)
-            if parsed:
-                items.append(parsed)
-        return {"items": items, "total": int(tracks.get("totalCount") or offset + len(items))}
-
-    def search(self, *, q: str, type: str, limit: int, market: str):
-        del market
-        if type != "track":
-            raise ValueError("SpotifyWebClient only supports track search")
-        payload = {
-            "variables": {
-                "query": q,
-                "limit": max(limit, 10),
-                "offset": 0,
-                "numberOfTopResults": max(limit, 10),
-                "includeArtistHasConcertsField": False,
-                "includeAudiobooks": True,
-                "includeAuthors": False,
-                "includePreReleases": True,
-                "includeEpisodeContentRatingsV2": False,
-                "sectionFilters": ["GENERIC", "VIDEO_CONTENT"],
-            },
-            "operationName": "searchTopResultsList",
-            "extensions": {
-                "persistedQuery": {
-                    "version": 1,
-                    "sha256Hash": _SEARCH_HASH,
-                }
-            },
-        }
-        data = self._pathfinder(payload)
-        tracks: list[dict] = []
-        self._collect_graphql_tracks(data, tracks)
-        deduped: list[dict] = []
-        seen: set[str] = set()
-        for track in tracks:
-            track_id = str(track.get("id") or "")
-            if track_id and track_id not in seen:
-                seen.add(track_id)
-                deduped.append(track)
-            if len(deduped) >= limit:
-                break
-        return {"tracks": {"items": deduped}}
-
-    @staticmethod
-    def _collect_graphql_tracks(value, tracks: list[dict]) -> None:
-        if isinstance(value, dict):
-            if value.get("__typename") == "TrackResponseWrapper":
-                parsed = spotify_graphql_track_to_api_track(value)
-                if parsed:
-                    tracks.append(parsed)
-                return
-            for child in value.values():
-                SpotifyWebClient._collect_graphql_tracks(child, tracks)
-        elif isinstance(value, list):
-            for child in value:
-                SpotifyWebClient._collect_graphql_tracks(child, tracks)
-
-    def current_user_saved_tracks_add(self, *, tracks: Sequence[str]):
-        uris = [track if str(track).startswith("spotify:track:") else f"spotify:track:{track}" for track in tracks]
-        payload = {
-            "variables": {"libraryItemUris": uris},
-            "operationName": "addToLibrary",
-            "extensions": {
-                "persistedQuery": {
-                    "version": 1,
-                    "sha256Hash": _SAVE_HASH,
-                }
-            },
-        }
-        return self._pathfinder(payload)
+def _is_persisted_query_error(exc: SpotifyAPIError) -> bool:
+    lowered = str(exc).lower()
+    return any(phrase in lowered for phrase in ("persistedquerynotfound", "persisted_query_not_found", "persisted query"))
 
 
 class SpotifyBackend:
@@ -536,13 +228,16 @@ class SpotifyBackend:
         return tracks
 
     def search_track(self, wanted: Track, limit: int = 5) -> list[Track]:
-        # Note: verbose logging for search is handled in resolve_matches
         for query in build_spotify_search_queries(wanted):
             try:
                 page = retry_spotify_call(
                     lambda query=query: self.client.search(q=query, type="track", limit=limit, market=self.market),
                     label="Spotify search",
                 )
+            except SpotifyAPIError as exc:
+                if _is_persisted_query_error(exc):
+                    raise FatalSearchError(str(exc)) from exc
+                raise
             except Exception as exc:
                 if is_spotify_query_too_long_error(exc):
                     continue
