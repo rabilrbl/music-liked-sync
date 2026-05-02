@@ -1,6 +1,6 @@
 import pytest
 import json
-from music_liked_sync.models import Track
+from music_liked_sync.models import FatalSearchError, Track
 from music_liked_sync.ytmusic import (
     YTMusicBackend,
     parse_ytm_track,
@@ -70,7 +70,7 @@ def test_youtube_sign_in_response_reports_expired_browser_auth():
 
     try:
         backend.liked_tracks()
-    except RuntimeError as exc:
+    except FatalSearchError as exc:
         message = str(exc)
     else:
         raise AssertionError("expected expired auth error")
@@ -90,7 +90,7 @@ def test_youtube_401_response_reports_expired_browser_auth():
 
     try:
         retry_ytm_call(fail, label="YTM rate_song", sleep_fn=lambda seconds: None)
-    except RuntimeError as exc:
+    except FatalSearchError as exc:
         message = str(exc)
     else:
         raise AssertionError("expected expired auth error")
