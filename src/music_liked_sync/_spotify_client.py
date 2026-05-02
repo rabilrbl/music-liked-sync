@@ -1,4 +1,5 @@
 import json
+import os
 import sys
 import time
 import urllib.error
@@ -6,13 +7,20 @@ import urllib.request
 from collections.abc import Callable, Sequence
 
 from .constants import (
+    SPOTIFY_LIBRARY_QUERY_HASH,
     SPOTIFY_MAX_RETRY_AFTER,
     SPOTIFY_RETRY_ATTEMPTS,
     SPOTIFY_RETRY_BASE_DELAY,
+    SPOTIFY_SAVE_QUERY_HASH,
+    SPOTIFY_SEARCH_QUERY_HASH,
     SPOTIFY_WEB_ORIGIN,
     SPOTIFY_WEB_PATHFINDER_URL,
 )
 from .models import SpotifyWebSessionState, Track
+
+_LIBRARY_HASH = os.environ.get("SPOTIFY_LIBRARY_QUERY_HASH", SPOTIFY_LIBRARY_QUERY_HASH)
+_SEARCH_HASH = os.environ.get("SPOTIFY_SEARCH_QUERY_HASH", SPOTIFY_SEARCH_QUERY_HASH)
+_SAVE_HASH = os.environ.get("SPOTIFY_SAVE_QUERY_HASH", SPOTIFY_SAVE_QUERY_HASH)
 
 
 class SpotifyAPIError(RuntimeError):
@@ -209,7 +217,7 @@ class SpotifyWebClient:
             "extensions": {
                 "persistedQuery": {
                     "version": 1,
-                    "sha256Hash": "087278b20b743578a6262c2b0b4bcd20d879c503cc359a2285baf083ef944240",
+                    "sha256Hash": _LIBRARY_HASH,
                 }
             },
         }
@@ -243,7 +251,7 @@ class SpotifyWebClient:
             "extensions": {
                 "persistedQuery": {
                     "version": 1,
-                    "sha256Hash": "75a88491b7c54a02065a24d6e836121ab20ca42d1bede25a0e06fe5018033ffe",
+                    "sha256Hash": _SEARCH_HASH,
                 }
             },
         }
@@ -283,7 +291,7 @@ class SpotifyWebClient:
             "extensions": {
                 "persistedQuery": {
                     "version": 1,
-                    "sha256Hash": "7c5a69420e2bfae3da5cc4e14cbc8bb3f6090f80afc00ffc179177f19be3f33d",
+                    "sha256Hash": _SAVE_HASH,
                 }
             },
         }
