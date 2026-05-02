@@ -141,7 +141,7 @@ def resolve_matches(
                 cache.store_match(cache_direction, wanted, match)
         else:
             progress.log(f"  [MISS]  {wanted.display} (no match in {len(candidates)} search results)")
-        
+
         return SearchResult(wanted=wanted, match=match, search_failed=False)
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
