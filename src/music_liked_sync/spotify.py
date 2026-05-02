@@ -8,6 +8,7 @@ from collections.abc import Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+from .browser_auth import BrowserSessionConfig, ensure_browser_session
 from .constants import (
     DEFAULT_SPOTIFY_WEB_LOGIN_TIMEOUT,
     SPOTIFY_MAX_RETRY_AFTER,
@@ -24,9 +25,6 @@ from .constants import (
 from .models import FatalSearchError, SpotifyWebSessionState, Track
 from .utils import (
     batched,
-    browser_session_lock,
-    cookie_value,
-    playwright_cookie_header,
     primary_search_artist,
     safe_page_user_agent,
     sleep_between_batches,
@@ -91,69 +89,31 @@ def ensure_spotify_web_session_state_from_session(
     login_timeout_seconds: float = DEFAULT_SPOTIFY_WEB_LOGIN_TIMEOUT,
     lock_path: Path | str,
 ) -> SpotifyWebSessionState:
-    try:
-        from playwright.sync_api import Error as PlaywrightError
-        from playwright.sync_api import sync_playwright
-    except ImportError as exc:
-        raise RuntimeError(
-            "Spotify web-session auth requires Playwright. Run: uv sync && uv run playwright install chromium"
-        ) from exc
-
-    session_dir.mkdir(parents=True, exist_ok=True)
     lock_path = Path(lock_path).expanduser()
     if not lock_path.is_absolute():
         lock_path = Path.cwd() / lock_path
-    deadline = time.time() + login_timeout_seconds
 
-    try:
-        with browser_session_lock(lock_path):
-            with sync_playwright() as p:
-                context = p.chromium.launch_persistent_context(
-                    str(session_dir),
-                    headless=headless,
-                    args=["--disable-blink-features=AutomationControlled"],
-                )
-                try:
-                    page = context.pages[0] if context.pages else context.new_page()
-                    user_agent = safe_page_user_agent(page)
-                    cookie_header = playwright_cookie_header(context.cookies([SPOTIFY_WEB_ORIGIN]))
+    def _extract_state(page, cookie_header, user_agent):
+        state = wait_for_spotify_web_session_state(page)
+        if not state.user_agent:
+            state = SpotifyWebSessionState(
+                access_token=state.access_token,
+                user_agent=user_agent,
+                client_token=state.client_token,
+                app_version=state.app_version,
+            )
+        return state
 
-                    if not cookie_value(cookie_header, SPOTIFY_WEB_REQUIRED_COOKIE):
-                        page.goto(SPOTIFY_WEB_ORIGIN, wait_until="domcontentloaded", timeout=60_000)
-                        user_agent = safe_page_user_agent(page)
-                        print(
-                            "Spotify Web Player login required. Complete login in the opened browser window; "
-                            "this browser profile will be reused on future runs.",
-                            file=sys.stderr,
-                        )
-                    while not cookie_value(cookie_header, SPOTIFY_WEB_REQUIRED_COOKIE) and time.time() < deadline:
-                        page.wait_for_timeout(2_000)
-                        cookie_header = playwright_cookie_header(context.cookies([SPOTIFY_WEB_ORIGIN]))
-                        user_agent = safe_page_user_agent(page)
-
-                    if not cookie_value(cookie_header, SPOTIFY_WEB_REQUIRED_COOKIE):
-                        raise RuntimeError(
-                            f"Spotify Web Player session is not logged in; missing {SPOTIFY_WEB_REQUIRED_COOKIE}. "
-                            "Complete Spotify login in the opened browser window, then rerun."
-                        )
-
-                    state = wait_for_spotify_web_session_state(page)
-                    if not state.user_agent:
-                        state = SpotifyWebSessionState(
-                            access_token=state.access_token,
-                            user_agent=user_agent,
-                            client_token=state.client_token,
-                            app_version=state.app_version,
-                        )
-                    print("Spotify Web Player token refreshed from persistent browser session", file=sys.stderr)
-                    return state
-                finally:
-                    context.close()
-    except PlaywrightError as exc:
-        raise RuntimeError(
-            "Could not open the persistent Spotify Web Player browser session. "
-            "If this is the first run, install the browser with: uv run playwright install chromium"
-        ) from exc
+    config = BrowserSessionConfig(
+        session_dir=session_dir,
+        origin=SPOTIFY_WEB_ORIGIN,
+        required_cookie=SPOTIFY_WEB_REQUIRED_COOKIE,
+        lock_path=lock_path,
+        label="Spotify Web Player",
+        headless=headless,
+        login_timeout_seconds=login_timeout_seconds,
+    )
+    return ensure_browser_session(config, _extract_state)
 
 
 class SpotifyAPIError(Exception):

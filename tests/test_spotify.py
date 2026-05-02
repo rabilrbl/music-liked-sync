@@ -6,7 +6,6 @@ from music_liked_sync.spotify import (
     SpotifyBackend,
     SpotifyWebClient,
     build_spotify_search_queries,
-    browser_session_lock,
     parse_spotify_track,
     spotify_graphql_track_to_api_track,
     spotify_graphql_library_item_to_api_item,
@@ -15,6 +14,7 @@ from music_liked_sync.spotify import (
     spotify_retry_delay_seconds,
     retry_spotify_call,
 )
+from music_liked_sync.utils import browser_session_lock
 
 
 def test_spotify_web_client_retries_once_after_401(monkeypatch):
