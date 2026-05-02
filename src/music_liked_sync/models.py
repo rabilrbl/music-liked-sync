@@ -32,3 +32,7 @@ class SearchResult(NamedTuple):
     match: Track | None
     search_failed: bool
     error_summary: str = ""
+
+
+class FatalSearchError(RuntimeError):
+    """Raised by search functions when the error is fatal to the entire batch (auth expired, API contract broken)."""

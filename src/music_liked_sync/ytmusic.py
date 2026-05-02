@@ -17,7 +17,7 @@ from .constants import (
     DEFAULT_BATCH_DELAY,
     DEFAULT_BATCH_SIZE,
 )
-from .models import Track
+from .models import FatalSearchError, Track
 from .utils import (
     batched,
     cookie_value,
@@ -142,7 +142,7 @@ def retry_ytm_call(
             return fn()
         except KeyError as exc:
             if is_ytm_auth_error(exc):
-                raise RuntimeError(ytm_auth_expired_message()) from exc
+                raise FatalSearchError(ytm_auth_expired_message()) from exc
             raise
         except json.JSONDecodeError as exc:
             last_exc = exc
@@ -156,7 +156,7 @@ def retry_ytm_call(
             sleep_fn(delay)
         except Exception as exc:
             if is_ytm_auth_error(exc):
-                raise RuntimeError(ytm_auth_expired_message()) from exc
+                raise FatalSearchError(ytm_auth_expired_message()) from exc
             raise
     if last_exc:
         raise last_exc

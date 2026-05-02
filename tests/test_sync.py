@@ -1,5 +1,5 @@
 from music_liked_sync.sync import resolve_matches, compute_missing, _Progress
-from music_liked_sync.models import Track
+from music_liked_sync.models import FatalSearchError, Track
 from music_liked_sync.cache import SyncCache
 
 
@@ -32,13 +32,22 @@ def test_resolve_matches_continues_when_search_errors_transiently():
     assert unmatched == wanted
 
 
-def test_resolve_matches_raises_runtime_error():
+def test_resolve_matches_raises_fatal_search_error():
     import pytest
     wanted = [Track(title="T", artists=("A",), source_id="1")]
     def search_fn(_track):
-        raise RuntimeError("fatal")
-    with pytest.raises(RuntimeError, match="fatal"):
+        raise FatalSearchError("fatal")
+    with pytest.raises(FatalSearchError, match="fatal"):
         resolve_matches(wanted, search_fn, None, "test")
+
+
+def test_resolve_matches_does_not_cancel_on_generic_runtime_error():
+    wanted = [Track(title="T", artists=("A",), source_id="1")]
+    def search_fn(_track):
+        raise RuntimeError("non-fatal runtime error")
+    matched, unmatched = resolve_matches(wanted, search_fn, None, "test")
+    assert matched == []
+    assert len(unmatched) == 1
 
 
 def test_resolve_matches_uses_cache_before_search(tmp_path):

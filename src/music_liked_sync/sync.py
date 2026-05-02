@@ -6,7 +6,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 from .cache import SyncCache
 from .constants import DEFAULT_BATCH_DELAY, DEFAULT_BATCH_SIZE
-from .models import SearchResult, Track
+from .models import FatalSearchError, SearchResult, Track
 from .utils import (
     batched,
     best_match,
@@ -128,7 +128,7 @@ def resolve_matches(
 
         try:
             candidates = search_fn(wanted)
-        except RuntimeError:
+        except FatalSearchError:
             raise
         except Exception as exc:
             summary = str(exc).strip().splitlines()[0][:180] if str(exc).strip() else exc.__class__.__name__
@@ -166,7 +166,7 @@ def resolve_matches(
                                 n_matched = len(matched)
                                 n_unmatched = len(unmatched)
                         progress.status(f"{label}: {n_matched} matched, {n_unmatched} unmatched")
-                    except RuntimeError:
+                    except FatalSearchError:
                         # Cancel pending futures and re-raise
                         for f in futures:
                             f.cancel()
