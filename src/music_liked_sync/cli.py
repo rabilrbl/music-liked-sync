@@ -61,12 +61,13 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     def vprint(*msg, **kwargs):
         if args.verbose:
+            kwargs.setdefault("file", sys.stderr)
             print(*msg, **kwargs)
 
     yt_browser_session_dir = Path(DEFAULT_YT_BROWSER_SESSION_DIR).expanduser()
     if not yt_browser_session_dir.is_absolute():
         yt_browser_session_dir = Path.cwd() / yt_browser_session_dir
-    
+
     spotify_web_session_dir = Path(DEFAULT_SPOTIFY_WEB_SESSION_DIR).expanduser()
     if not spotify_web_session_dir.is_absolute():
         spotify_web_session_dir = Path.cwd() / spotify_web_session_dir
@@ -104,7 +105,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         spotify_liked = cache.get_library("spotify", args.cache_library_ttl) if args.cache_read else None
         if spotify_liked is None:
-            spotify_liked = spotify.liked_tracks(max_workers=args.workers, verbose=args.verbose)
+            try:
+                spotify_liked = spotify.liked_tracks(max_workers=args.workers, verbose=args.verbose)
+            except RuntimeError as exc:
+                print(str(exc), file=sys.stderr)
+                return 2
             if args.cache_write:
                 cache.store_library("spotify", spotify_liked)
         else:
@@ -135,9 +140,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             "batch_delay": args.batch_delay,
             "max_add": args.max_add,
             "yt_auth": ytm.mode,
-            "yt_browser_session_dir": str(yt_browser_session_dir),
             "spotify_auth": getattr(spotify, "mode", "web-session"),
-            "spotify_web_session_dir": str(spotify_web_session_dir),
             "cache_db": str(cache_path),
             "cache_read": bool(args.cache_read),
             "cache_write": bool(args.cache_write),
@@ -147,20 +150,24 @@ def main(argv: Sequence[str] | None = None) -> int:
         if do_spotify_to_ytm:
             missing = compute_missing(spotify_liked, ytm_liked, verbose=args.verbose)
             vprint(f"Spotify → YTM: {len(missing)} tracks missing in YTM")
-            matched, unmatched = resolve_matches(
-                missing,
-                ytm.search_track,
-                args.max_add,
-                "Spotify → YTM",
-                batch_size=args.batch_size,
-                batch_delay=args.batch_delay,
-                cache=cache,
-                cache_direction="spotify_to_ytm",
-                cache_read=args.cache_read,
-                cache_write=args.cache_write,
-                max_workers=args.workers,
-                verbose=args.verbose,
-            )
+            try:
+                matched, unmatched = resolve_matches(
+                    missing,
+                    ytm.search_track,
+                    args.max_add,
+                    "Spotify → YTM",
+                    batch_size=args.batch_size,
+                    batch_delay=args.batch_delay,
+                    cache=cache,
+                    cache_direction="spotify_to_ytm",
+                    cache_read=args.cache_read,
+                    cache_write=args.cache_write,
+                    max_workers=args.workers,
+                    verbose=args.verbose,
+                )
+            except RuntimeError as exc:
+                print(str(exc), file=sys.stderr)
+                return 2
             if args.apply:
                 to_like = [match for _, match in matched]
                 if args.cache_read:
@@ -190,32 +197,40 @@ def main(argv: Sequence[str] | None = None) -> int:
         if do_ytm_to_spotify:
             missing = compute_missing(ytm_liked, spotify_liked, verbose=args.verbose)
             vprint(f"YTM → Spotify: {len(missing)} tracks missing in Spotify")
-            matched, unmatched = resolve_matches(
-                missing,
-                spotify.search_track,
-                args.max_add,
-                "YTM → Spotify",
-                batch_size=args.batch_size,
-                batch_delay=args.batch_delay,
-                cache=cache,
-                cache_direction="ytm_to_spotify",
-                cache_read=args.cache_read,
-                cache_write=args.cache_write,
-                max_workers=args.workers,
-                verbose=args.verbose,
-            )
+            try:
+                matched, unmatched = resolve_matches(
+                    missing,
+                    spotify.search_track,
+                    args.max_add,
+                    "YTM → Spotify",
+                    batch_size=args.batch_size,
+                    batch_delay=args.batch_delay,
+                    cache=cache,
+                    cache_direction="ytm_to_spotify",
+                    cache_read=args.cache_read,
+                    cache_write=args.cache_write,
+                    max_workers=args.workers,
+                    verbose=args.verbose,
+                )
+            except RuntimeError as exc:
+                print(str(exc), file=sys.stderr)
+                return 2
             if args.apply:
                 to_save = [match for _, match in matched]
                 if args.cache_read:
                     to_save = [track for track in to_save if not cache.is_liked("spotify", track.source_id)]
                 vprint(f"YTM → Spotify: Saving {len(to_save)} tracks to Spotify")
-                spotify.save_tracks(
-                    to_save,
-                    batch_size=args.batch_size,
-                    batch_delay=args.batch_delay,
-                    max_workers=args.workers,
-                    verbose=args.verbose,
-                )
+                try:
+                    spotify.save_tracks(
+                        to_save,
+                        batch_size=args.batch_size,
+                        batch_delay=args.batch_delay,
+                        max_workers=args.workers,
+                        verbose=args.verbose,
+                    )
+                except RuntimeError as exc:
+                    print(str(exc), file=sys.stderr)
+                    return 2
                 if args.cache_write:
                     cache.mark_liked_many("spotify", [track.source_id for track in to_save])
             report["ytm_to_spotify"] = {
@@ -240,9 +255,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             "batch_delay": args.batch_delay,
             "max_add": args.max_add,
             "yt_auth": ytm.mode,
-            "yt_browser_session_dir": str(yt_browser_session_dir),
             "spotify_auth": getattr(spotify, "mode", "web-session"),
-            "spotify_web_session_dir": str(spotify_web_session_dir),
             "cache_db": str(cache_path),
             "cache_read": bool(args.cache_read),
             "cache_write": bool(args.cache_write),

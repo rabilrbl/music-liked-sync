@@ -115,7 +115,7 @@ def ensure_yt_browser_auth_from_session(
 
                     headers = build_yt_browser_auth_headers(cookie_header, user_agent=user_agent)
                     print(
-                        f"YouTube Music browser session auth refreshed from persistent session: {session_dir}",
+                        "YouTube Music browser session auth refreshed from persistent browser session",
                         file=sys.stderr,
                     )
                     return headers
@@ -215,7 +215,7 @@ class YTMusicBackend:
 
     def liked_tracks(self, limit: int | None = None, verbose: bool = False) -> list[Track]:
         if verbose:
-            print("Fetching YouTube Music liked songs...")
+            print("Fetching YouTube Music liked songs...", file=sys.stderr)
         result = retry_ytm_call(
             lambda: self.client.get_liked_songs(limit=limit or 10000),
             label="YTM get_liked_songs",
@@ -223,7 +223,7 @@ class YTMusicBackend:
         items = result.get("tracks", []) if isinstance(result, dict) else result
         tracks = [t for t in (parse_ytm_track(item) for item in (items or [])) if t]
         if verbose:
-            print(f"  Finished fetching {len(tracks)} tracks from YouTube Music")
+            print(f"  Finished fetching {len(tracks)} tracks from YouTube Music", file=sys.stderr)
         return tracks
 
     def search_track(self, wanted: Track, limit: int = 5) -> list[Track]:
@@ -245,19 +245,19 @@ class YTMusicBackend:
         verbose: bool = False,
     ) -> None:
         if verbose:
-            print(f"Liking {len(tracks)} tracks on YouTube Music...")
+            print(f"Liking {len(tracks)} tracks on YouTube Music...", file=sys.stderr)
         chunks = batched(tracks, batch_size)
         print_lock = threading.Lock()
 
         def vprint_track(track_id):
             if verbose:
                 with print_lock:
-                    print(f"  [LIKE] {track_id}")
+                    print(f"  [LIKE] {track_id}", file=sys.stderr)
 
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             for index, chunk in enumerate(chunks):
                 if verbose:
-                    print(f"  Batch {index+1}/{len(chunks)} ({len(chunk)} tracks)")
+                    print(f"  Batch {index+1}/{len(chunks)} ({len(chunk)} tracks)", file=sys.stderr)
                 futures = []
                 for track in chunk:
                     def make_call(t=track):
