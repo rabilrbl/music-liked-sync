@@ -5,8 +5,10 @@ import time
 import urllib.error
 import urllib.request
 from collections.abc import Callable, Sequence
+from pathlib import Path
 
 from .constants import (
+    DEFAULT_SPOTIFY_HASH_CACHE,
     SPOTIFY_LIBRARY_QUERY_HASH,
     SPOTIFY_MAX_RETRY_AFTER,
     SPOTIFY_RETRY_ATTEMPTS,
@@ -18,9 +20,29 @@ from .constants import (
 )
 from .models import SpotifyWebSessionState, Track
 
-_LIBRARY_HASH = os.environ.get("SPOTIFY_LIBRARY_QUERY_HASH", SPOTIFY_LIBRARY_QUERY_HASH)
-_SEARCH_HASH = os.environ.get("SPOTIFY_SEARCH_QUERY_HASH", SPOTIFY_SEARCH_QUERY_HASH)
-_SAVE_HASH = os.environ.get("SPOTIFY_SAVE_QUERY_HASH", SPOTIFY_SAVE_QUERY_HASH)
+_FALLBACK_HASHES: dict[str, str] = {
+    "fetchLibraryTracks": os.environ.get("SPOTIFY_LIBRARY_QUERY_HASH", SPOTIFY_LIBRARY_QUERY_HASH),
+    "searchTopResultsList": os.environ.get("SPOTIFY_SEARCH_QUERY_HASH", SPOTIFY_SEARCH_QUERY_HASH),
+    "addToLibrary": os.environ.get("SPOTIFY_SAVE_QUERY_HASH", SPOTIFY_SAVE_QUERY_HASH),
+}
+
+
+def load_hash_cache(cache_path: str | Path) -> dict[str, str]:
+    path = Path(cache_path)
+    if path.is_file():
+        try:
+            data = json.loads(path.read_text())
+            if isinstance(data, dict):
+                return {str(k): str(v) for k, v in data.items()}
+        except (json.JSONDecodeError, OSError):
+            pass
+    return {}
+
+
+def save_hash_cache(hashes: dict[str, str], cache_path: str | Path) -> None:
+    path = Path(cache_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(hashes, indent=2) + "\n")
 
 
 class SpotifyAPIError(RuntimeError):
@@ -183,11 +205,23 @@ def retry_spotify_call(
         raise last_exc
 
 
+def _is_persisted_query_error(exc: "SpotifyAPIError") -> bool:
+    lowered = str(exc).lower()
+    return any(phrase in lowered for phrase in ("persistedquerynotfound", "persisted_query_not_found", "persisted query"))
+
+
 # --- HTTP client ---
 
 class SpotifyWebClient:
-    def __init__(self, token_provider: Callable[[], SpotifyWebSessionState | tuple[str, str]]) -> None:
+    def __init__(
+        self,
+        token_provider: Callable[[], SpotifyWebSessionState | tuple[str, str]],
+        *,
+        hash_cache_path: str | Path = DEFAULT_SPOTIFY_HASH_CACHE,
+    ) -> None:
         self._token_provider = token_provider
+        self._hash_cache_path = Path(hash_cache_path)
+        self._hashes = self._load_hashes()
         self._state = self._normalize_state(token_provider())
 
     @staticmethod
@@ -197,31 +231,44 @@ class SpotifyWebClient:
         access_token, user_agent = state
         return SpotifyWebSessionState(access_token=access_token, user_agent=user_agent)
 
+    def _load_hashes(self) -> dict[str, str]:
+        cached = load_hash_cache(self._hash_cache_path)
+        return {**_FALLBACK_HASHES, **cached}
+
+    def _get_hash(self, operation_name: str) -> str:
+        return self._hashes.get(operation_name, "")
+
     def _refresh_token(self) -> None:
         self._state = self._normalize_state(self._token_provider())
+        self._hashes = self._load_hashes()
 
-    def _pathfinder(self, payload: dict):
+    def _pathfinder(self, operation_name: str, variables: dict):
+        def _make_payload():
+            return {
+                "variables": variables,
+                "operationName": operation_name,
+                "extensions": {
+                    "persistedQuery": {
+                        "version": 1,
+                        "sha256Hash": self._get_hash(operation_name),
+                    }
+                },
+            }
+
         try:
-            return spotify_pathfinder_request_json(payload, state=self._state)
+            return spotify_pathfinder_request_json(_make_payload(), state=self._state)
         except SpotifyAPIError as exc:
-            if exc.http_status != 401:
-                raise
-            self._refresh_token()
-            return spotify_pathfinder_request_json(payload, state=self._state)
+            if exc.http_status == 401:
+                self._refresh_token()
+                return spotify_pathfinder_request_json(_make_payload(), state=self._state)
+            if _is_persisted_query_error(exc):
+                self._refresh_token()
+                return spotify_pathfinder_request_json(_make_payload(), state=self._state)
+            raise
 
     def current_user_saved_tracks(self, *, limit: int, offset: int, market: str):
         del market
-        payload = {
-            "variables": {"offset": offset, "limit": limit},
-            "operationName": "fetchLibraryTracks",
-            "extensions": {
-                "persistedQuery": {
-                    "version": 1,
-                    "sha256Hash": _LIBRARY_HASH,
-                }
-            },
-        }
-        data = self._pathfinder(payload)
+        data = self._pathfinder("fetchLibraryTracks", {"offset": offset, "limit": limit})
         tracks = (((data.get("data") or {}).get("me") or {}).get("library") or {}).get("tracks") or {}
         items = []
         for item in tracks.get("items") or []:
@@ -234,28 +281,18 @@ class SpotifyWebClient:
         del market
         if type != "track":
             raise ValueError("SpotifyWebClient only supports track search")
-        payload = {
-            "variables": {
-                "query": q,
-                "limit": max(limit, 10),
-                "offset": 0,
-                "numberOfTopResults": max(limit, 10),
-                "includeArtistHasConcertsField": False,
-                "includeAudiobooks": True,
-                "includeAuthors": False,
-                "includePreReleases": True,
-                "includeEpisodeContentRatingsV2": False,
-                "sectionFilters": ["GENERIC", "VIDEO_CONTENT"],
-            },
-            "operationName": "searchTopResultsList",
-            "extensions": {
-                "persistedQuery": {
-                    "version": 1,
-                    "sha256Hash": _SEARCH_HASH,
-                }
-            },
-        }
-        data = self._pathfinder(payload)
+        data = self._pathfinder("searchTopResultsList", {
+            "query": q,
+            "limit": max(limit, 10),
+            "offset": 0,
+            "numberOfTopResults": max(limit, 10),
+            "includeArtistHasConcertsField": False,
+            "includeAudiobooks": True,
+            "includeAuthors": False,
+            "includePreReleases": True,
+            "includeEpisodeContentRatingsV2": False,
+            "sectionFilters": ["GENERIC", "VIDEO_CONTENT"],
+        })
         tracks: list[dict] = []
         self._collect_graphql_tracks(data, tracks)
         deduped: list[dict] = []
@@ -285,14 +322,4 @@ class SpotifyWebClient:
 
     def current_user_saved_tracks_add(self, *, tracks: Sequence[str]):
         uris = [track if str(track).startswith("spotify:track:") else f"spotify:track:{track}" for track in tracks]
-        payload = {
-            "variables": {"libraryItemUris": uris},
-            "operationName": "addToLibrary",
-            "extensions": {
-                "persistedQuery": {
-                    "version": 1,
-                    "sha256Hash": _SAVE_HASH,
-                }
-            },
-        }
-        return self._pathfinder(payload)
+        return self._pathfinder("addToLibrary", {"libraryItemUris": uris})
