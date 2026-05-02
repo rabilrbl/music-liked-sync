@@ -3,7 +3,7 @@ import json
 
 import pytest
 import music_liked_sync.cli
-from music_liked_sync.models import Track
+from music_liked_sync.models import FatalSearchError, Track
 from music_liked_sync.cli import build_arg_parser, positive_int, non_negative_float
 
 
@@ -200,7 +200,7 @@ def test_main_returns_2_when_ytm_search_fails(monkeypatch, tmp_path, capsys):
             return []
 
         def search_track(self, wanted):
-            raise RuntimeError("ytm search fail")
+            raise FatalSearchError("ytm search fail")
 
     monkeypatch.setattr(music_liked_sync.cli, "SpotifyBackend", MockSpotify)
     monkeypatch.setattr(music_liked_sync.cli, "YTMusicBackend", MockYTM)
@@ -223,7 +223,7 @@ def test_main_returns_2_when_spotify_search_fails(monkeypatch, tmp_path, capsys)
             return []
 
         def search_track(self, wanted):
-            raise RuntimeError("spotify search fail")
+            raise FatalSearchError("spotify search fail")
 
     class MockYTM:
         mode = "browser-session"
