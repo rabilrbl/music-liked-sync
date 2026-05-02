@@ -1,3 +1,4 @@
+import json
 import sys
 import time
 from collections.abc import Callable, Sequence
@@ -7,10 +8,13 @@ from pathlib import Path
 from ._spotify_client import (
     SpotifyAPIError as SpotifyAPIError,
     SpotifyWebClient as SpotifyWebClient,
+    _is_persisted_query_error as _is_persisted_query_error,
     is_spotify_query_too_long_error as is_spotify_query_too_long_error,
     is_spotify_transient_error as is_spotify_transient_error,
+    load_hash_cache as load_hash_cache,
     parse_spotify_track as parse_spotify_track,
     retry_spotify_call as retry_spotify_call,
+    save_hash_cache as save_hash_cache,
     spotify_graphql_library_item_to_api_item as spotify_graphql_library_item_to_api_item,
     spotify_graphql_track_to_api_track as spotify_graphql_track_to_api_track,
     spotify_pathfinder_request_json as spotify_pathfinder_request_json,
@@ -18,6 +22,7 @@ from ._spotify_client import (
 )
 from .browser_auth import BrowserSessionConfig, ensure_browser_session
 from .constants import (
+    DEFAULT_SPOTIFY_HASH_CACHE,
     DEFAULT_SPOTIFY_WEB_LOGIN_TIMEOUT,
     SPOTIFY_WEB_ORIGIN,
     SPOTIFY_WEB_PATHFINDER_URL,
@@ -46,13 +51,16 @@ def spotify_web_token_from_payload(data: dict) -> str:
     return str(token)
 
 
-def wait_for_spotify_web_session_state(page, *, timeout_ms: int = 60_000) -> SpotifyWebSessionState:
+def wait_for_spotify_web_session_state(
+    page, *, timeout_ms: int = 60_000, hash_cache_path: str | Path | None = None
+) -> SpotifyWebSessionState:
     captured_headers: dict[str, str] = {}
+    discovered_hashes: dict[str, str] = {}
 
     def is_token_response(response) -> bool:
         return response.url.startswith(SPOTIFY_WEB_TOKEN_URL_PREFIX) and response.status == 200
 
-    def capture_pathfinder_headers(request) -> None:
+    def capture_pathfinder_request(request) -> None:
         if request.url != SPOTIFY_WEB_PATHFINDER_URL:
             return
         headers = request.headers
@@ -60,8 +68,17 @@ def wait_for_spotify_web_session_state(page, *, timeout_ms: int = 60_000) -> Spo
             value = headers.get(key)
             if value:
                 captured_headers[key] = value
+        try:
+            body = json.loads(request.post_data or "{}")
+        except (json.JSONDecodeError, TypeError):
+            return
+        if isinstance(body, dict):
+            op_name = body.get("operationName")
+            sha = (body.get("extensions") or {}).get("persistedQuery", {}).get("sha256Hash")
+            if op_name and sha:
+                discovered_hashes[op_name] = sha
 
-    page.on("request", capture_pathfinder_headers)
+    page.on("request", capture_pathfinder_request)
     try:
         with page.expect_response(is_token_response, timeout=timeout_ms) as response_info:
             page.goto(SPOTIFY_WEB_ORIGIN, wait_until="domcontentloaded", timeout=timeout_ms)
@@ -72,13 +89,32 @@ def wait_for_spotify_web_session_state(page, *, timeout_ms: int = 60_000) -> Spo
                     lambda req: req.url == SPOTIFY_WEB_PATHFINDER_URL and bool(req.headers.get("client-token")),
                     timeout=5_000,
                 )
-                capture_pathfinder_headers(request)
+                capture_pathfinder_request(request)
             except Exception:
                 pass
     except Exception as exc:
         raise RuntimeError("Spotify Web Player token request did not complete from the loaded web app") from exc
     if not isinstance(data, dict):
         raise RuntimeError("Spotify Web Player token response was not a JSON object")
+
+    # Navigate to pages that trigger our target operations so we can capture their hashes.
+    _target_operations = {"fetchLibraryTracks", "searchTopResultsList", "addToLibrary"}
+    _discovery_navs = [
+        (f"{SPOTIFY_WEB_ORIGIN}/collection/tracks", "fetchLibraryTracks"),
+        (f"{SPOTIFY_WEB_ORIGIN}/search/discover-hash", "searchTopResultsList"),
+    ]
+    for url, _ in _discovery_navs:
+        if _target_operations.issubset(discovered_hashes.keys()):
+            break
+        try:
+            page.goto(url, wait_until="domcontentloaded", timeout=15_000)
+            page.wait_for_timeout(2_000)
+        except Exception:
+            pass
+
+    if hash_cache_path and discovered_hashes:
+        save_hash_cache(discovered_hashes, hash_cache_path)
+
     return SpotifyWebSessionState(
         access_token=spotify_web_token_from_payload(data),
         user_agent=safe_page_user_agent(page),
@@ -93,13 +129,14 @@ def ensure_spotify_web_session_state_from_session(
     headless: bool = False,
     login_timeout_seconds: float = DEFAULT_SPOTIFY_WEB_LOGIN_TIMEOUT,
     lock_path: Path | str,
+    hash_cache_path: str | Path = DEFAULT_SPOTIFY_HASH_CACHE,
 ) -> SpotifyWebSessionState:
     lock_path = Path(lock_path).expanduser()
     if not lock_path.is_absolute():
         lock_path = Path.cwd() / lock_path
 
     def _extract_state(page, cookie_header, user_agent):
-        state = wait_for_spotify_web_session_state(page)
+        state = wait_for_spotify_web_session_state(page, hash_cache_path=hash_cache_path)
         if not state.user_agent:
             state = SpotifyWebSessionState(
                 access_token=state.access_token,
@@ -150,11 +187,6 @@ def build_spotify_search_queries(wanted: Track) -> list[str]:
     return queries
 
 
-def _is_persisted_query_error(exc: SpotifyAPIError) -> bool:
-    lowered = str(exc).lower()
-    return any(phrase in lowered for phrase in ("persistedquerynotfound", "persisted_query_not_found", "persisted query"))
-
-
 class SpotifyBackend:
     def __init__(
         self,
@@ -164,6 +196,7 @@ class SpotifyBackend:
         web_headless: bool = False,
         web_login_timeout_seconds: float = DEFAULT_SPOTIFY_WEB_LOGIN_TIMEOUT,
         lock_path: Path | str,
+        hash_cache_path: str | Path = DEFAULT_SPOTIFY_HASH_CACHE,
     ) -> None:
         self.market = market
         self.mode = "web-session"
@@ -178,7 +211,9 @@ class SpotifyBackend:
                 headless=web_headless,
                 login_timeout_seconds=web_login_timeout_seconds,
                 lock_path=lock_path,
-            )
+                hash_cache_path=hash_cache_path,
+            ),
+            hash_cache_path=hash_cache_path,
         )
 
     def liked_tracks(self, max_workers: int = 4, verbose: bool = False) -> list[Track]:
