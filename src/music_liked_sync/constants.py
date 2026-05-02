@@ -35,3 +35,8 @@ SPOTIFY_MAX_RETRY_AFTER = 30.0
 YTM_RETRY_ATTEMPTS = 4
 YTM_RETRY_BASE_DELAY = 2.0
 ARTIST_SPLIT_RE = re.compile(r"\s*(?:,|/|&| x | and | feat\.? | ft\.? | featuring )\s*", re.IGNORECASE)
+
+# Spotify GraphQL persisted query hashes — overridable via env for rotation events
+SPOTIFY_LIBRARY_QUERY_HASH = "087278b20b743578a6262c2b0b4bcd20d879c503cc359a2285baf083ef944240"
+SPOTIFY_SEARCH_QUERY_HASH = "75a88491b7c54a02065a24d6e836121ab20ca42d1bede25a0e06fe5018033ffe"
+SPOTIFY_SAVE_QUERY_HASH = "7c5a69420e2bfae3da5cc4e14cbc8bb3f6090f80afc00ffc179177f19be3f33d"
