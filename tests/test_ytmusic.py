@@ -1,5 +1,7 @@
 import pytest
 import json
+import threading
+from pathlib import Path
 from music_liked_sync.models import FatalSearchError, Track
 from music_liked_sync.ytmusic import (
     YTMusicBackend,
@@ -9,6 +11,51 @@ from music_liked_sync.ytmusic import (
     is_ytm_auth_error,
     retry_ytm_call,
 )
+
+
+def test_ytm_session_requires_loaded_music_origin_without_google_sign_in_link():
+    from music_liked_sync.ytmusic import ytm_session_is_authenticated
+
+    class Locator:
+        def __init__(self, count):
+            self._count = count
+
+        def count(self):
+            return self._count
+
+    class Page:
+        def __init__(self, url, sign_in_count, ready_state="complete"):
+            self.url = url
+            self._sign_in_count = sign_in_count
+            self._ready_state = ready_state
+
+        def evaluate(self, expression):
+            assert expression == "document.readyState"
+            return self._ready_state
+
+        def locator(self, selector):
+            assert selector == "a[href*='accounts.google.com/ServiceLogin']"
+            return Locator(self._sign_in_count)
+
+    assert ytm_session_is_authenticated(Page("https://music.youtube.com/", 0)) is True
+    assert ytm_session_is_authenticated(Page("https://music.youtube.com/", 1)) is False
+    assert ytm_session_is_authenticated(Page("https://accounts.google.com/ServiceLogin", 0)) is False
+    assert ytm_session_is_authenticated(Page("https://music.youtube.com/", 0, "loading")) is False
+
+
+def test_ytm_browser_session_uses_supported_chrome_user_agent(monkeypatch, tmp_path):
+    import music_liked_sync.ytmusic as ytmusic
+
+    captured = {}
+
+    def fake_ensure(config, extractor):
+        captured["config"] = config
+        return {"cookie": "c"}
+
+    monkeypatch.setattr(ytmusic, "ensure_browser_session", fake_ensure)
+    ytmusic.ensure_yt_browser_auth_from_session(session_dir=tmp_path, lock_path=tmp_path / "lock")
+
+    assert captured["config"].user_agent == ytmusic.YTMUSIC_BROWSER_USER_AGENT
 
 
 def test_parse_ytm_track_handles_artists_list():
@@ -97,6 +144,59 @@ def test_youtube_401_response_reports_expired_browser_auth():
 
     assert "YouTube Music auth appears expired" in message
     assert "persistent browser session" in message
+
+
+def test_youtube_auth_error_triggers_refresh_and_retries():
+    call_count = 0
+
+    class FlakyYTMusicClient:
+        def get_liked_songs(self, limit):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                raise KeyError("Sign in to listen to your liked tracks")
+            return {"tracks": [{"title": "Song", "videoId": "v1", "artists": [{"name": "A"}]}]}
+
+    class FakeYTMusic:
+        def __init__(self, headers):
+            self.headers = headers
+
+    backend = YTMusicBackend.__new__(YTMusicBackend)
+    backend.client = FlakyYTMusicClient()
+    backend._session_dir = Path("/tmp/fake")
+    backend._lock_path = Path("/tmp/fake.lock")
+    backend._headless = False
+    backend._login_timeout_seconds = 300.0
+    backend._auth_lock = threading.Lock()
+
+    def mock_refresh():
+        backend.client = FlakyYTMusicClient()  # reset the client as if refresh succeeded
+
+    backend._refresh_auth = mock_refresh
+
+    tracks = backend.liked_tracks()
+    assert len(tracks) == 1
+    assert tracks[0].title == "Song"
+    assert call_count == 2  # first call failed, second succeeded
+
+
+def test_youtube_auth_error_no_refresh_when_no_session_config():
+    class SignedOutYTMusicClient:
+        def get_liked_songs(self, limit):
+            raise KeyError("Sign in to listen to your liked tracks")
+
+    backend = YTMusicBackend.__new__(YTMusicBackend)
+    backend.client = SignedOutYTMusicClient()
+    # No _session_dir, _lock_path, or _auth_lock set
+
+    try:
+        backend.liked_tracks()
+    except FatalSearchError as exc:
+        message = str(exc)
+    else:
+        raise AssertionError("expected expired auth error")
+
+    assert "YouTube Music auth appears expired" in message
 
 
 # --- parse_ytm_track edge cases ---

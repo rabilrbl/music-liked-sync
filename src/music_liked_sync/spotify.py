@@ -56,9 +56,19 @@ def wait_for_spotify_web_session_state(
 ) -> SpotifyWebSessionState:
     captured_headers: dict[str, str] = {}
     discovered_hashes: dict[str, str] = {}
+    token_payload: dict | None = None
 
     def is_token_response(response) -> bool:
         return response.url.startswith(SPOTIFY_WEB_TOKEN_URL_PREFIX) and response.status == 200
+
+    def capture_token_payload(response) -> None:
+        nonlocal token_payload
+        try:
+            payload = response.json()
+        except Exception:
+            return
+        if isinstance(payload, dict) and payload.get("accessToken"):
+            token_payload = payload
 
     def capture_pathfinder_request(request) -> None:
         if request.url != SPOTIFY_WEB_PATHFINDER_URL:
@@ -78,11 +88,13 @@ def wait_for_spotify_web_session_state(
             if op_name and sha:
                 discovered_hashes[op_name] = sha
 
+    page.on("response", capture_token_payload)
     page.on("request", capture_pathfinder_request)
     try:
-        with page.expect_response(is_token_response, timeout=timeout_ms) as response_info:
-            page.goto(SPOTIFY_WEB_ORIGIN, wait_until="domcontentloaded", timeout=timeout_ms)
-        data = response_info.value.json()
+        page.goto(SPOTIFY_WEB_ORIGIN, wait_until="domcontentloaded", timeout=timeout_ms)
+        page.wait_for_timeout(1_000)
+        if token_payload is None:
+            raise RuntimeError("Spotify Web Player token response did not include a readable access token")
         if not captured_headers.get("client-token"):
             try:
                 request = page.wait_for_request(
@@ -94,9 +106,6 @@ def wait_for_spotify_web_session_state(
                 pass
     except Exception as exc:
         raise RuntimeError("Spotify Web Player token request did not complete from the loaded web app") from exc
-    if not isinstance(data, dict):
-        raise RuntimeError("Spotify Web Player token response was not a JSON object")
-
     # Navigate to pages that trigger our target operations so we can capture their hashes.
     _target_operations = {"fetchLibraryTracks", "searchTopResultsList", "addToLibrary"}
     _discovery_navs = [
@@ -114,9 +123,8 @@ def wait_for_spotify_web_session_state(
 
     if hash_cache_path and discovered_hashes:
         save_hash_cache(discovered_hashes, hash_cache_path)
-
     return SpotifyWebSessionState(
-        access_token=spotify_web_token_from_payload(data),
+        access_token=spotify_web_token_from_payload(token_payload),
         user_agent=safe_page_user_agent(page),
         client_token=captured_headers.get("client-token"),
         app_version=captured_headers.get("spotify-app-version"),

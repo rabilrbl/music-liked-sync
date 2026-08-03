@@ -103,7 +103,7 @@ def test_main_returns_2_when_ytm_liked_tracks_fails(monkeypatch, tmp_path, capsy
     class MockYTM:
         mode = "browser-session"
 
-        def __init__(self, auth):
+        def __init__(self, auth, **kwargs):
             pass
 
         def liked_tracks(self, **kwargs):
@@ -133,7 +133,7 @@ def test_main_returns_2_when_ytm_like_tracks_fails(monkeypatch, tmp_path, capsys
     class MockYTM:
         mode = "browser-session"
 
-        def __init__(self, auth):
+        def __init__(self, auth, **kwargs):
             pass
 
         def liked_tracks(self, **kwargs):
@@ -167,7 +167,7 @@ def test_main_returns_2_when_spotify_liked_tracks_fails(monkeypatch, tmp_path, c
     class MockYTM:
         mode = "browser-session"
 
-        def __init__(self, auth):
+        def __init__(self, auth, **kwargs):
             pass
 
     monkeypatch.setattr(music_liked_sync.cli, "SpotifyBackend", MockSpotify)
@@ -193,7 +193,7 @@ def test_main_returns_2_when_ytm_search_fails(monkeypatch, tmp_path, capsys):
     class MockYTM:
         mode = "browser-session"
 
-        def __init__(self, auth):
+        def __init__(self, auth, **kwargs):
             pass
 
         def liked_tracks(self, **kwargs):
@@ -228,7 +228,7 @@ def test_main_returns_2_when_spotify_search_fails(monkeypatch, tmp_path, capsys)
     class MockYTM:
         mode = "browser-session"
 
-        def __init__(self, auth):
+        def __init__(self, auth, **kwargs):
             pass
 
         def liked_tracks(self, **kwargs):
@@ -264,7 +264,7 @@ def test_main_returns_2_when_spotify_save_fails(monkeypatch, tmp_path, capsys):
     class MockYTM:
         mode = "browser-session"
 
-        def __init__(self, auth):
+        def __init__(self, auth, **kwargs):
             pass
 
         def liked_tracks(self, **kwargs):
@@ -302,7 +302,7 @@ def test_main_success_full_sync(monkeypatch, tmp_path, capsys):
     class MockYTM:
         mode = "browser-session"
 
-        def __init__(self, auth):
+        def __init__(self, auth, **kwargs):
             pass
 
         def liked_tracks(self, **kwargs):
@@ -357,7 +357,7 @@ def test_main_verbose_keeps_stdout_machine_readable(monkeypatch, tmp_path, capsy
     class MockYTM:
         mode = "browser-session"
 
-        def __init__(self, auth):
+        def __init__(self, auth, **kwargs):
             pass
 
         def liked_tracks(self, **kwargs):

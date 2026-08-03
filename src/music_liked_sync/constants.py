@@ -22,6 +22,7 @@ SPOTIFY_WEB_PATHFINDER_URL = "https://api-partner.spotify.com/pathfinder/v2/quer
 SPOTIFY_WEB_REQUIRED_COOKIE = "sp_dc"
 SPOTIFY_API_BASE = "https://api.spotify.com/v1"
 DEFAULT_BROWSER_USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36"
+YTMUSIC_BROWSER_USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36"
 
 DEFAULT_YT_BROWSER_SESSION_DIR = "auth/ytmusic-browser-session"
 DEFAULT_YT_BROWSER_LOCK_FILE = "state/locks/ytmusic-browser-session.lock"

@@ -85,7 +85,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 2
 
     try:
-        ytm = YTMusicBackend(yt_auth_headers)
+        ytm = YTMusicBackend(
+            yt_auth_headers,
+            session_dir=yt_browser_session_dir,
+            lock_path=DEFAULT_YT_BROWSER_LOCK_FILE,
+        )
     except ValueError as exc:
         print(str(exc), file=sys.stderr)
         return 2
